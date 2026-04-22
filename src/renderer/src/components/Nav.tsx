@@ -9,8 +9,14 @@ import { Link, useLocation } from "react-router-dom";
 import ExitToApp from '@mui/icons-material/ExitToApp';
 import { useStatusStore } from "../store/store";
 import { controlClient } from '../integration/controlClient'
+import type { ExtraConfig } from '../../../shared/config'
 
-export default function Nav({ receivingVideo, settings }) {
+type NavProps = {
+  receivingVideo: boolean
+  settings: ExtraConfig | null
+}
+
+export default function Nav({ receivingVideo, settings }: NavProps) {
   const [value, setValue] = React.useState(0);
   const [isPlugged] = useStatusStore(state => [state.isPlugged])
   const { pathname } = useLocation()

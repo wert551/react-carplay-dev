@@ -1,27 +1,32 @@
 import { useEffect, useRef, useState } from "react";
 import {Typography} from "@mui/material";
+import type { ExtraConfig } from "../../../shared/config";
 
-const Camera = ({settings}) => {
+type CameraProps = {
+  settings: ExtraConfig | null
+}
+
+const Camera = ({settings}: CameraProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [cameraFound, setCameraFound] = useState(false)
   console.log(settings)
 
   useEffect(() => {
     if(!settings) return
-    getVideo();
+    getVideo(settings);
   }, [videoRef, settings]);
 
-  const getVideo = () => {
+  const getVideo = (activeSettings: ExtraConfig) => {
     navigator.mediaDevices
-      .getUserMedia({ video: { width: 800, deviceId: settings.camera} })
-      .then(stream => {
+      .getUserMedia({ video: { width: 800, deviceId: activeSettings.camera} })
+      .then((stream) => {
         console.log(stream)
         setCameraFound(true)
         let video = videoRef.current!;
         video.srcObject = stream;
         video.play();
       })
-      .catch(err => {
+      .catch((err: unknown) => {
         console.error("error:", err);
       });
   };

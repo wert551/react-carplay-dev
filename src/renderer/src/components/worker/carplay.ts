@@ -26,7 +26,7 @@ onmessage = async (event: MessageEvent<Command>) => {
   switch (event.data.type) {
     case 'start':
       if (carplayWeb) return
-      config = event.data.payload
+      config = event.data.payload.config
       const device = await findDevice()
       if (device) {
         console.log("starting device")

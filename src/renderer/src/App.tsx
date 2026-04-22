@@ -11,6 +11,7 @@ import { Box, Modal } from '@mui/material'
 import { useCarplayStore, useStatusStore } from "./store/store";
 import { ThemeProvider, createTheme } from '@mui/material/styles';
 import useMediaQuery from '@mui/material/useMediaQuery';
+import type { KeyBindings } from '../../shared/config'
 
 // rm -rf node_modules/.vite; npm run dev
 
@@ -57,7 +58,7 @@ function App() {
   const onKeyDown = (event: KeyboardEvent) => {
     if(!settings) return
     if(Object.values(settings.bindings).includes(event.code)) {
-      let action = Object.keys(settings.bindings).find(key =>
+      let action = (Object.keys(settings.bindings) as Array<keyof KeyBindings>).find(key =>
         settings.bindings[key] === event.code
       )
       console.log(action)

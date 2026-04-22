@@ -1,4 +1,4 @@
-import { ExtraConfig } from "../../../shared/config";
+import { ExtraConfig, KeyBindings as KeyBindingConfig } from "../../../shared/config";
 import { Box, Button, Modal, Paper, styled, Typography } from "@mui/material";
 import Grid from '@mui/material/Unstable_Grid2'
 import { useEffect, useState } from "react";
@@ -6,7 +6,7 @@ import { InfinitySpin } from "react-loader-spinner";
 
 interface KeyBindingsProps {
   settings: ExtraConfig,
-  updateKey: (key: any, value: any) => void
+  updateKey: (key: keyof ExtraConfig, value: unknown) => void
 }
 
 const Item = styled(Paper)(({ theme }) => ({
@@ -30,7 +30,7 @@ const style = {
 };
 
 export function KeyBindings({ settings, updateKey }: KeyBindingsProps) {
-  const [keyToBind, setKeyToBind] = useState('')
+  const [keyToBind, setKeyToBind] = useState<keyof KeyBindingConfig | null>(null)
   const [openWaiting, setOpenWaiting] = useState(false)
 
   useEffect(() => {
@@ -42,22 +42,23 @@ export function KeyBindings({ settings, updateKey }: KeyBindingsProps) {
 
   }, [openWaiting, keyToBind]);
 
-  const awaitKeyPress = (keyName) => {
+  const awaitKeyPress = (keyName: keyof KeyBindingConfig) => {
     setKeyToBind(keyName)
     setOpenWaiting(true)
   }
 
   const setKey = (keyPressed: KeyboardEvent) => {
+    if (!keyToBind) return
     const oldSettings = {...settings.bindings}
     oldSettings[keyToBind] = keyPressed.code
     updateKey('bindings', oldSettings)
     setOpenWaiting(false)
-    setKeyToBind('')
+    setKeyToBind(null)
   }
 
   const renderBindings = () => {
     return(
-      Object.keys(settings.bindings).map((shortcut) => {
+      (Object.keys(settings.bindings) as Array<keyof KeyBindingConfig>).map((shortcut) => {
         return (
           <Grid key={shortcut} xs={3}>
             <Item>

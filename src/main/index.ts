@@ -24,14 +24,30 @@ let piMost: null | PiMost = null
 
 let socket: null | Socket = null
 
+const isPiRuntimeProfile = () =>
+  process.env.REACT_CARPLAY_PROFILE === 'pi' || process.env.REACT_CARPLAY_PI === '1'
+
+const configureChromiumRuntime = () => {
+  app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+  app.commandLine.appendSwitch('disable-webusb-security', 'true')
+
+  if (isPiRuntimeProfile()) {
+    app.commandLine.appendSwitch('disable-features', 'Vulkan,WebGPU')
+    app.commandLine.appendSwitch('use-gl', 'egl')
+    app.commandLine.appendSwitch('use-angle', 'gles')
+    console.log('React-CarPlay Pi runtime profile enabled: WebGPU/Vulkan disabled, WebGL via EGL/GLES preferred')
+  } else {
+    app.commandLine.appendSwitch('enable-experimental-web-platform-features')
+  }
+}
+
 const handleSettingsReq = (_: IpcMainEvent ) => {
   console.log("settings request")
   mainWindow?.webContents.send('settings', runtimeControl.getConfig())
 }
 
 
-app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-app.commandLine.appendSwitch('disable-webusb-security', 'true')
+configureChromiumRuntime()
 console.log(app.commandLine.hasSwitch('disable-webusb-security'))
 function createWindow(): void {
   const config = runtimeControl.getConfig()
@@ -120,7 +136,6 @@ function createWindow(): void {
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
-app.commandLine.appendSwitch('enable-experimental-web-platform-features');
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required")
 app.whenReady().then(() => {
   initializeServices()

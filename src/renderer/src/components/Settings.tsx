@@ -31,6 +31,8 @@ interface SettingsProps {
   settings: ExtraConfig
 }
 
+type SettingsInputMap = Partial<Record<keyof ExtraConfig, () => React.ReactElement>>
+
 const Transition = React.forwardRef(function Transition(
   props: TransitionProps & {
     children: React.ReactElement<any, any>;
@@ -49,15 +51,15 @@ function Settings({ settings }: SettingsProps) {
   const [openCan, setOpenCan] = useState<boolean>(false)
   const saveSettings = useCarplayStore(state => state.saveSettings)
 
-  const settingsChange = (key, value) => {
+  const settingsChange = (key: keyof ExtraConfig, value: unknown) => {
     console.log("changing settings to ", {
       ...settings,
       [key]: value
     }, key, value)
-    setActiveSettings((prevState) => ({...prevState, [key]: value}))
+    setActiveSettings((prevState) => ({...prevState, [key]: value} as ExtraConfig))
   }
 
-  const renderInput = {
+  const renderInput: SettingsInputMap = {
     height: () => <Grid key={'height'} xs={4}><TextField label={'HEIGHT'} type={"Number"} value={activeSettings.height} onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
       settingsChange('height', parseInt(event.target.value))
     }}/></Grid>,
@@ -144,6 +146,22 @@ function Settings({ settings }: SettingsProps) {
             }}>
               <FormControlLabel value={'browser-webusb'} control={<Radio />} label={'WEBUSB'} />
               <FormControlLabel value={'external'} control={<Radio />} label={'EXTERNAL'} />
+            </RadioGroup>
+          </FormControl>
+        </Grid>
+      )
+    },
+    videoRenderer: () => {
+      return (
+        <Grid key={"videoRenderer"} xs={4}>
+          <FormControl>
+            <FormLabel id={"videoRenderer"}>VIDEO RENDERER</FormLabel>
+            <RadioGroup row value={activeSettings.videoRenderer} onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+              settingsChange('videoRenderer', (event.target as HTMLInputElement).value)
+            }}>
+              <FormControlLabel value={'webgl'} control={<Radio />} label={'WEBGL'} />
+              <FormControlLabel value={'webgl2'} control={<Radio />} label={'WEBGL2'} />
+              <FormControlLabel value={'webgpu'} control={<Radio />} label={'WEBGPU'} />
             </RadioGroup>
           </FormControl>
         </Grid>
@@ -280,7 +298,7 @@ function Settings({ settings }: SettingsProps) {
   const renderSettings = () => {
     return (
       <Grid container spacing={2}>
-        {Object.keys(activeSettings).map((k) => {
+        {(Object.keys(activeSettings) as Array<keyof ExtraConfig>).map((k) => {
           return renderInput[k]?.()
         })}
         <Grid xs={12} container>

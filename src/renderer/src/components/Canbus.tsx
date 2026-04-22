@@ -7,7 +7,7 @@ import { InfinitySpin } from "react-loader-spinner";
 interface KeyBindingsProps {
   settings: ExtraConfig,
   setOpenCan: React.Dispatch<React.SetStateAction<boolean>>,
-  setSettings: (key: any, value: any) => void
+  setSettings: (key: keyof ExtraConfig, value: unknown) => void
 }
 
 const Item = styled(Paper)(({ theme }) => ({

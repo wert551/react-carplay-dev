@@ -1,7 +1,7 @@
 // Based on https://github.com/w3c/webcodecs/blob/main/samples/video-decode-display/renderer_webgl.js
 // License: https://www.w3.org/copyright/software-license-2023/
 
-import { FrameRenderer } from './Render.worker'
+import type { FrameRenderer } from './Render.worker'
 
 export class WebGLRenderer implements FrameRenderer {
   #canvas: OffscreenCanvas | null = null
@@ -103,7 +103,7 @@ export class WebGLRenderer implements FrameRenderer {
     const gl = this.#ctx!
 
     // Upload the frame.
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame as unknown as TexImageSource)
     // eslint-disable-next-line @typescript-eslint/no-unsafe-call
     frame.close()
 

@@ -1,7 +1,7 @@
 // Based on https://github.com/w3c/webcodecs/blob/main/samples/video-decode-display/renderer_webgpu.js
 // License: https://www.w3.org/copyright/software-license-2023/
 
-import { FrameRenderer } from './Render.worker'
+import type { FrameRenderer } from './Render.worker'
 
 export class WebGPURenderer implements FrameRenderer {
   #canvas: OffscreenCanvas | null = null
@@ -13,7 +13,7 @@ export class WebGPURenderer implements FrameRenderer {
   #format: GPUTextureFormat | null = null
   #device: GPUDevice | null = null
   #pipeline: GPURenderPipeline | null = null
-  #sampler: GPUSamplerDescriptor | null = null
+  #sampler: GPUSampler | null = null
 
   // Generates two triangles covering the whole canvas.
   static vertexShaderSource = `
@@ -66,12 +66,17 @@ export class WebGPURenderer implements FrameRenderer {
   }
 
   async #start() {
-    const adapter = await navigator.gpu.requestAdapter()
+    const gpu = navigator.gpu
+    if (!gpu) {
+      throw Error('WebGPU is unavailable')
+    }
+    const adapter = await gpu.requestAdapter()
     if (!adapter) {
       throw Error('WebGPU Adapter is null')
     }
     this.#device = await adapter.requestDevice()
-    this.#format = navigator.gpu.getPreferredCanvasFormat()
+    const format = gpu.getPreferredCanvasFormat()
+    this.#format = format
 
     if (!this.#canvas) {
       throw Error('Canvas is null')
@@ -85,7 +90,7 @@ export class WebGPURenderer implements FrameRenderer {
 
     this.#ctx.configure({
       device: this.#device,
-      format: this.#format,
+      format,
       alphaMode: 'opaque',
     })
 
@@ -102,7 +107,7 @@ export class WebGPURenderer implements FrameRenderer {
           code: WebGPURenderer.fragmentShaderSource,
         }),
         entryPoint: 'frag_main',
-        targets: [{ format: this.#format }],
+        targets: [{ format }],
       },
       primitive: {
         topology: 'triangle-list',
@@ -128,6 +133,9 @@ export class WebGPURenderer implements FrameRenderer {
     }
     if (!this.#pipeline) {
       throw Error('Pipeline is null')
+    }
+    if (!this.#sampler) {
+      throw Error('Sampler is null')
     }
 
     this.#canvas.width = frame.displayWidth

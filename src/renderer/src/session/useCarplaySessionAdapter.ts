@@ -12,7 +12,7 @@ import { controlClient } from '../integration/controlClient'
 import { useCarplayStore, useStatusStore } from '../store/store'
 import useCarplayAudio from '../components/useCarplayAudio'
 import { useCarplayTouch } from '../components/useCarplayTouch'
-import type { CarPlayWorker } from '../components/worker/types'
+import type { CarPlayWorker, KeyCommand } from '../components/worker/types'
 import { InitEvent } from '../components/worker/render/RenderEvents'
 
 const width = window.innerWidth
@@ -24,6 +24,22 @@ type UseCarplaySessionAdapterProps = {
   command: string
   commandCounter: number
 }
+
+const keyCommands = new Set<string>([
+  'left',
+  'right',
+  'selectDown',
+  'selectUp',
+  'back',
+  'down',
+  'home',
+  'play',
+  'pause',
+  'next',
+  'prev'
+])
+
+const isKeyCommand = (command: string): command is KeyCommand => keyCommands.has(command)
 
 const reportSessionEvent = (event: SessionAdapterEvent) => {
   controlClient.reportSessionEvent(event).catch((error) => {
@@ -39,7 +55,7 @@ export const useCarplaySessionAdapter = ({
   const navigate = useNavigate()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const mainElem = useRef<HTMLDivElement>(null)
-  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sessionTimingRef = useRef({
     startCommandAt: 0,
     dongleSearchStartedAt: 0,
@@ -106,12 +122,12 @@ export const useCarplaySessionAdapter = ({
       { type: 'module' }
     )
     const canvas = canvasElement.transferControlToOffscreen()
-    worker.postMessage(new InitEvent(canvas, channels.video.port2), [
+    worker.postMessage(new InitEvent(canvas, channels.video.port2, settings.videoRenderer), [
       canvas,
       channels.video.port2
     ])
     return worker
-  }, [canvasElement, channels.video])
+  }, [canvasElement, channels.video, settings.videoRenderer])
 
   useLayoutEffect(() => {
     if (canvasRef.current) {
@@ -337,6 +353,7 @@ export const useCarplaySessionAdapter = ({
   }, [carplayWorker])
 
   useEffect(() => {
+    if (!isKeyCommand(command)) return
     carplayWorker.postMessage({ type: 'keyCommand', command })
   }, [carplayWorker, command, commandCounter])
 

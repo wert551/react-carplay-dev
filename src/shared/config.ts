@@ -32,6 +32,7 @@ export interface CanConfig {
 export type StartMode = 'auto' | 'manual'
 export type ShellMode = 'standalone' | 'hosted'
 export type RuntimeEngine = 'browser-webusb' | 'external'
+export type VideoRenderer = 'webgl' | 'webgl2' | 'webgpu'
 
 export type ExtraConfig = DongleConfig & {
   kiosk: boolean
@@ -42,6 +43,7 @@ export type ExtraConfig = DongleConfig & {
   startMode: StartMode
   shellMode: ShellMode
   runtimeEngine: RuntimeEngine
+  videoRenderer: VideoRenderer
   showDebugSettings: boolean
   bindings: KeyBindings
   most?: Most
@@ -77,6 +79,7 @@ export const createDefaultConfig = (dongleDefaults: DongleConfig): ExtraConfig =
   startMode: 'auto',
   shellMode: 'standalone',
   runtimeEngine: 'browser-webusb',
+  videoRenderer: 'webgl',
   showDebugSettings: true,
   bindings: DEFAULT_BINDINGS,
   most: {},
@@ -137,6 +140,10 @@ export const validateConfig = (
 
   if (!['browser-webusb', 'external'].includes(config.runtimeEngine)) {
     errors.push('runtimeEngine must be "browser-webusb" or "external"')
+  }
+
+  if (!['webgl', 'webgl2', 'webgpu'].includes(config.videoRenderer)) {
+    errors.push('videoRenderer must be "webgl", "webgl2", or "webgpu"')
   }
 
   if (typeof config.showDebugSettings !== 'boolean') {

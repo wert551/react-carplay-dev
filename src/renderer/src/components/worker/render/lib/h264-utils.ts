@@ -50,7 +50,7 @@ export class RawBitstream {
       this.originalByteLength = this.buffer.byteLength
       this.max = 8192 << 3
     } else {
-      this.buffer = new Uint8Array(stream, 0, stream.byteLength)
+      this.buffer = stream.subarray(0, stream.byteLength)
       this.max = this.buffer.byteLength << 3
       this.originalByteLength = stream.byteLength
     }
@@ -558,7 +558,7 @@ export class NALUStream {
       throw new Error('NALUStream error: invalid boxSize')
 
     /* don't copy this.buf from input, just project it */
-    this.buf = new Uint8Array(buf, 0, buf.length)
+    this.buf = buf.subarray(0, buf.length)
 
     if (!this.type || !this.boxSize) {
       const { type, boxSize } = this.getType(4)
@@ -617,7 +617,7 @@ export class NALUStream {
   static array2hex(array: Uint8Array) {
     // buffer is an ArrayBuffer
     return Array.prototype.map
-      .call(new Uint8Array(array, 0, array.byteLength), x =>
+      .call(array.subarray(0, array.byteLength), (x: number) =>
         ('00' + x.toString(16)).slice(-2),
       )
       .join(' ')

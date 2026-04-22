@@ -3,8 +3,8 @@ import { DongleConfig, TouchAction, CarplayMessage, AudioData } from 'node-carpl
 export type AudioPlayerKey = string & { __brand: 'AudioPlayerKey' }
 
 export type CarplayWorkerMessage =
-  | { data: CarplayMessage }
-  | { data: { type: 'requestBuffer'; message: AudioData } }
+  | CarplayMessage
+  | { type: 'requestBuffer'; message: AudioData }
 
 export type InitialisePayload = {
   videoPort: MessagePort
@@ -38,7 +38,7 @@ export type Command =
   | { type: 'start'; payload: StartPayload }
   | { type: 'touch'; payload: { x: number; y: number; action: TouchAction } }
   | { type: 'initialise'; payload: InitialisePayload }
-  | { type: 'audioBuffer'; payload: AudioPlayerPayload }
+  | { type: 'audioPlayer'; payload: AudioPlayerPayload }
   | { type: 'microphoneInput'; payload: Int16Array }
   | { type: 'frame'}
   | { type: 'keyCommand', command: KeyCommand}
@@ -46,5 +46,5 @@ export type Command =
 export interface CarPlayWorker
   extends Omit<Worker, 'postMessage' | 'onmessage'> {
   postMessage(message: Command, transfer?: Transferable[]): void
-  onmessage: ((this: Worker, ev: CarplayWorkerMessage) => any) | null
+  onmessage: ((this: Worker, ev: MessageEvent<CarplayWorkerMessage>) => unknown) | null
 }

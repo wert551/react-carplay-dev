@@ -1,6 +1,8 @@
+import type { VideoRenderer } from '../../../../../shared/config'
+
 export type WorkerEventType = 'init' | 'frame' | 'renderDone'
 
-export type Renderer = 'webgl' | 'webgl2' | 'webgpu'
+export type Renderer = VideoRenderer
 
 export interface WorkerEvent {
   type: WorkerEventType

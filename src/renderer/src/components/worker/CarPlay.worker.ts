@@ -18,10 +18,23 @@ let config: Partial<DongleConfig> | null = null
 const audioBuffers: Record<AudioPlayerKey, RingBuffer<Int16Array>> = {}
 const pendingAudio: Record<AudioPlayerKey, Int16Array[]> = {}
 
+const toArrayBuffer = (data: Uint8Array): ArrayBuffer => {
+  if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength && data.buffer instanceof ArrayBuffer) {
+    return data.buffer
+  }
+
+  if (data.buffer instanceof ArrayBuffer) {
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+  }
+
+  return new Uint8Array(data).buffer
+}
+
 const handleMessage = (message: CarplayMessage) => {
   const { type, message: payload } = message
   if (type === 'video' && videoPort) {
-    videoPort.postMessage(new RenderEvent(payload.data), [payload.data.buffer])
+    const frameData = toArrayBuffer(payload.data as Uint8Array)
+    videoPort.postMessage(new RenderEvent(frameData), [frameData])
   } else if (type === 'audio' && payload.data) {
     const { decodeType, audioType } = payload
     const audioKey = createAudioPlayerKey(decodeType, audioType)
@@ -35,7 +48,7 @@ const handleMessage = (message: CarplayMessage) => {
       payload.data = undefined
 
       const getPlayerMessage = {
-        type: 'getAudioPlayer',
+        type: 'requestBuffer',
         message: {
           ...payload,
         },

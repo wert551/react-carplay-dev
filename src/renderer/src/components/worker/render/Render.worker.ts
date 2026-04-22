@@ -7,17 +7,13 @@ import { WebGLRenderer } from './WebGLRenderer'
 import { WebGPURenderer } from './WebGPURenderer'
 
 export interface FrameRenderer {
-  draw(data: VideoFrame): void
+  draw(data: VideoFrame): void | Promise<void>
 }
 
 // eslint-disable-next-line no-restricted-globals
-const scope = self as unknown as Worker
-
-type HostType = Window & typeof globalThis
+const scope = self as unknown as DedicatedWorkerGlobalScope
 
 export class RenderWorker {
-  constructor(private host: HostType) {}
-
   private renderer: FrameRenderer | null = null
   private videoPort: MessagePort | null = null
   private pendingFrame: VideoFrame | null = null
@@ -76,7 +72,12 @@ export class RenderWorker {
         this.renderer = new WebGL2Renderer(event.canvas)
         break
       case 'webgpu':
-        this.renderer = new WebGPURenderer(event.canvas)
+        if (navigator.gpu) {
+          this.renderer = new WebGPURenderer(event.canvas)
+        } else {
+          console.warn('WebGPU renderer requested but unavailable; falling back to WebGL')
+          this.renderer = new WebGLRenderer(event.canvas)
+        }
         break
     }
     this.videoPort = event.videoPort
@@ -120,7 +121,7 @@ export class RenderWorker {
 }
 
 // eslint-disable-next-line no-restricted-globals
-const worker = new RenderWorker(self)
+const worker = new RenderWorker()
 scope.addEventListener('message', (event: MessageEvent<WorkerEvent>) => {
   if (event.data.type === 'init') {
     worker.init(event.data as InitEvent)
