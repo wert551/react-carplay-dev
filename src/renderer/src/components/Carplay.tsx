@@ -1,11 +1,11 @@
-import React from "react";
-import { RotatingLines } from 'react-loader-spinner'
+import React, { Suspense } from "react";
 //import './App.css'
-import { useLocation } from "react-router-dom";
 import { ExtraConfig} from "../../../shared/config";
 import { useStatusStore } from "../store/store";
-import { Typography } from "@mui/material";
-import { useCarplaySessionAdapter } from '../session/useCarplaySessionAdapter'
+import { logSessionEvent } from '../../../shared/sessionLog'
+import { CarplaySurface } from './CarplaySurface'
+
+const BrowserWebUsbCarplay = React.lazy(() => import('./BrowserWebUsbCarplay'))
 
 interface CarplayProps {
   settings: ExtraConfig,
@@ -14,85 +14,42 @@ interface CarplayProps {
 }
 
 function Carplay({ settings, command, commandCounter }: CarplayProps) {
-  const [isPlugged, deviceFound, session] = useStatusStore(state => [state.isPlugged, state.deviceFound, state.session])
-  const { pathname } = useLocation()
-  const { canvasRef, mainElem, sendTouchEvent } = useCarplaySessionAdapter({
-    settings,
-    command,
-    commandCounter
-  })
-  // const pathname = "/"
-  console.log(pathname)
-
-  const isLoading = !isPlugged
+  if (settings.runtimeEngine === 'external') {
+    return <ExternalRuntimeCarplaySurface />
+  }
 
   return (
-    <div
-      style={pathname === '/' ? { height: '100%', touchAction: 'none' } : { height: '1px' }}
-      id={'main'}
-      className="App"
-      ref={mainElem}
-    >
-      {(deviceFound === false || isLoading) && pathname === '/' && (
-        <div
-          style={{
-            position: 'absolute',
-            width: '100%',
-            height: '100%',
-            display: 'flex',
-            justifyContent: 'center',
-            alignItems: 'center'
-          }}
-        >
-          {deviceFound === false && (
-            <div>
-              <Typography>Searching For Dongle</Typography>
-              <RotatingLines
-                strokeColor="grey"
-                strokeWidth="5"
-                animationDuration="0.75"
-                width="96"
-                visible={true}
-              />
-            </div>
-          )}
-          {deviceFound && (
-            <div>
-              <Typography>{session === 'error' ? 'CarPlay Session Error' : 'Searching For Phone'}</Typography>
-              <RotatingLines
-                strokeColor="grey"
-                strokeWidth="5"
-                animationDuration="0.75"
-                width="96"
-                visible={true}
-              />
-            </div>
-          )}
-        </div>
-      )}
-      <div
-        id="videoContainer"
-        onPointerDown={sendTouchEvent}
-        onPointerMove={sendTouchEvent}
-        onPointerUp={sendTouchEvent}
-        onPointerCancel={sendTouchEvent}
-        onPointerOut={sendTouchEvent}
-        style={{
-          height: '100%',
-          width: '100%',
-          padding: 0,
-          margin: 0,
-          display: 'flex',
-          visibility: isPlugged ? 'visible' : 'hidden'
-        }}
-      >
-        <canvas
-          ref={canvasRef}
-          id={'video'}
-          style={isPlugged ? { height: '100%' } : { height: '0%' }}
-        />
-      </div>
-    </div>
+    <Suspense fallback={null}>
+      <BrowserWebUsbCarplay settings={settings} command={command} commandCounter={commandCounter} />
+    </Suspense>
+  )
+}
+
+function ExternalRuntimeCarplaySurface() {
+  const [isPlugged, deviceFound, session] = useStatusStore(state => [state.isPlugged, state.deviceFound, state.session])
+  const canvasRef = React.useRef<HTMLCanvasElement>(null)
+  const mainElem = React.useRef<HTMLDivElement>(null)
+
+  React.useEffect(() => {
+    logSessionEvent('adapter', 'adapter.disabled', {
+      reason: 'runtimeEngine external; WebUSB adapter is not started'
+    })
+  }, [])
+
+  const sendTouchEvent = React.useCallback(() => {
+    // External runtime mode intentionally does not use browser/WebUSB touch forwarding.
+  }, [])
+
+  return (
+    <CarplaySurface
+      canvasRef={canvasRef}
+      mainElem={mainElem}
+      sendTouchEvent={sendTouchEvent}
+      isPlugged={isPlugged}
+      deviceFound={deviceFound}
+      session={session}
+      runtimeEngine={'external'}
+    />
   )
 }
 

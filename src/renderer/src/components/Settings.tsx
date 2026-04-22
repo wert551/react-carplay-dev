@@ -134,6 +134,21 @@ function Settings({ settings }: SettingsProps) {
         </Grid>
       )
     },
+    runtimeEngine: () => {
+      return (
+        <Grid key={"runtimeEngine"} xs={4}>
+          <FormControl>
+            <FormLabel id={"runtimeEngine"}>RUNTIME ENGINE</FormLabel>
+            <RadioGroup row value={activeSettings.runtimeEngine} onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+              settingsChange('runtimeEngine', (event.target as HTMLInputElement).value)
+            }}>
+              <FormControlLabel value={'browser-webusb'} control={<Radio />} label={'WEBUSB'} />
+              <FormControlLabel value={'external'} control={<Radio />} label={'EXTERNAL'} />
+            </RadioGroup>
+          </FormControl>
+        </Grid>
+      )
+    },
     piMost: () => {
       return (
         <Grid key={'pimost'} xs={4}>

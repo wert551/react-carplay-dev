@@ -31,6 +31,7 @@ export interface CanConfig {
 
 export type StartMode = 'auto' | 'manual'
 export type ShellMode = 'standalone' | 'hosted'
+export type RuntimeEngine = 'browser-webusb' | 'external'
 
 export type ExtraConfig = DongleConfig & {
   kiosk: boolean
@@ -40,6 +41,7 @@ export type ExtraConfig = DongleConfig & {
   canbus: boolean
   startMode: StartMode
   shellMode: ShellMode
+  runtimeEngine: RuntimeEngine
   showDebugSettings: boolean
   bindings: KeyBindings
   most?: Most
@@ -74,6 +76,7 @@ export const createDefaultConfig = (dongleDefaults: DongleConfig): ExtraConfig =
   canbus: false,
   startMode: 'auto',
   shellMode: 'standalone',
+  runtimeEngine: 'browser-webusb',
   showDebugSettings: true,
   bindings: DEFAULT_BINDINGS,
   most: {},
@@ -130,6 +133,10 @@ export const validateConfig = (
 
   if (!['standalone', 'hosted'].includes(config.shellMode)) {
     errors.push('shellMode must be "standalone" or "hosted"')
+  }
+
+  if (!['browser-webusb', 'external'].includes(config.runtimeEngine)) {
+    errors.push('runtimeEngine must be "browser-webusb" or "external"')
   }
 
   if (typeof config.showDebugSettings !== 'boolean') {

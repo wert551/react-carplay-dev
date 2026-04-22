@@ -12,6 +12,7 @@ export type SessionState =
 export type DesiredSessionState = 'stopped' | 'running'
 
 export type SessionMetadata = {
+  runtimeEngine: string | null
   adapterReadyAt: number | null
   lastCommandAt: number | null
   lastEventAt: number | null
@@ -97,6 +98,7 @@ export const DEFAULT_STATUS: CarplayStatus = {
   pendingCommands: [],
   activeCommands: [],
   metadata: {
+    runtimeEngine: null,
     adapterReadyAt: null,
     lastCommandAt: null,
     lastEventAt: null,

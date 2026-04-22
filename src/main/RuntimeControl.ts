@@ -32,12 +32,15 @@ export class RuntimeControl extends EventEmitter {
     logSessionEvent('runtime', 'runtime.initialized', {
       startMode: config.startMode,
       shellMode: config.shellMode,
+      runtimeEngine: config.runtimeEngine,
       desiredSession: this.status.desiredSession
     })
+    this.status.metadata.runtimeEngine = config.runtimeEngine
     this.configStore.on('configChanged', (config: ExtraConfig) => {
       logSessionEvent('runtime', 'runtime.config_changed', {
         startMode: config.startMode,
         shellMode: config.shellMode,
+        runtimeEngine: config.runtimeEngine,
         showDebugSettings: config.showDebugSettings
       })
       this.applyStartupMode(config)
@@ -52,19 +55,23 @@ export class RuntimeControl extends EventEmitter {
     renderer.once('destroyed', () => {
       if (this.renderer === renderer) {
         this.renderer = null
+        const config = this.configStore.getConfig()
         logSessionEvent('runtime', 'runtime.renderer_destroyed', {
+          runtimeEngine: config.runtimeEngine,
           desiredSession: this.status.desiredSession,
           pendingCommands: this.status.pendingCommands.length,
           activeCommands: this.status.activeCommands.length
         })
-        this.setStatus({
-          rendererReady: false,
-          session: 'idle',
-          deviceFound: false,
-          isPlugged: false,
-          receivingVideo: false,
-          activeCommands: []
-        })
+        if (config.runtimeEngine === 'browser-webusb') {
+          this.setStatus({
+            rendererReady: false,
+            session: 'idle',
+            deviceFound: false,
+            isPlugged: false,
+            receivingVideo: false,
+            activeCommands: []
+          })
+        }
       }
     })
   }
@@ -156,9 +163,17 @@ export class RuntimeControl extends EventEmitter {
     this.setStatus({
       rendererReady: true,
       metadata: {
-        adapterReadyAt: Date.now()
+        adapterReadyAt: Date.now(),
+        runtimeEngine: config.runtimeEngine
       }
     })
+
+    if (config.runtimeEngine === 'external') {
+      logSessionEvent('runtime', 'runtime.external_engine_selected', {
+        desiredSession: this.status.desiredSession,
+        pendingCommands: this.status.pendingCommands.length
+      })
+    }
 
     if (
       this.status.desiredSession === 'running' &&
@@ -379,6 +394,12 @@ export class RuntimeControl extends EventEmitter {
   }
 
   private applyStartupMode(config: ExtraConfig): void {
+    this.setStatus({
+      metadata: {
+        runtimeEngine: config.runtimeEngine
+      }
+    })
+
     if (config.startMode === 'manual' && this.status.session === 'idle') {
       this.setStatus({ desiredSession: 'stopped' })
       return
