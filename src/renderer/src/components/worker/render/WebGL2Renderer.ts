@@ -32,7 +32,13 @@ export class WebGL2Renderer implements FrameRenderer {
 
   constructor(canvas: OffscreenCanvas) {
     this.#canvas = canvas
-    const gl = (this.#ctx = canvas.getContext('webgl2'))
+    const gl = (this.#ctx = canvas.getContext('webgl2', {
+      alpha: false,
+      antialias: false,
+      desynchronized: true,
+      powerPreference: 'high-performance',
+      preserveDrawingBuffer: false
+    }))
     if (!gl) {
       throw Error('WebGL context is null')
     }
@@ -95,7 +101,10 @@ export class WebGL2Renderer implements FrameRenderer {
   }
 
   draw(frame: VideoFrame): void {
-    if (this.#canvas) {
+    if (
+      this.#canvas &&
+      (this.#canvas.width !== frame.displayWidth || this.#canvas.height !== frame.displayHeight)
+    ) {
       this.#canvas.width = frame.displayWidth
       this.#canvas.height = frame.displayHeight
     }

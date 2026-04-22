@@ -8,6 +8,7 @@ import { Socket } from './Socket'
 import {Canbus} from "./Canbus"
 
 import { ExtraConfig, createDefaultConfig } from '../shared/config'
+import type { VideoRenderer } from '../shared/config'
 import { CarplayStatusUpdate, CONTROL_CHANNELS, SessionAdapterEvent } from '../shared/control'
 import { ConfigStore } from './ConfigStore'
 import { RuntimeControl } from './RuntimeControl'
@@ -27,6 +28,18 @@ let socket: null | Socket = null
 const isPiRuntimeProfile = () =>
   process.env.REACT_CARPLAY_PROFILE === 'pi' || process.env.REACT_CARPLAY_PI === '1'
 
+const getPiVideoRenderer = (): VideoRenderer => {
+  const renderer = process.env.REACT_CARPLAY_VIDEO_RENDERER
+  switch (renderer) {
+    case 'webgl':
+    case 'webgl2':
+    case 'webgpu':
+      return renderer
+    default:
+      return 'webgl2'
+  }
+}
+
 const configureChromiumRuntime = () => {
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
   app.commandLine.appendSwitch('disable-webusb-security', 'true')
@@ -34,9 +47,9 @@ const configureChromiumRuntime = () => {
   if (isPiRuntimeProfile()) {
     app.commandLine.appendSwitch('disable-features', 'Vulkan,WebGPU')
     app.commandLine.appendSwitch('ignore-gpu-blocklist')
-    app.commandLine.appendSwitch('use-gl', 'egl')
-    app.commandLine.appendSwitch('use-angle', 'gles')
-    console.log('React-CarPlay Pi runtime profile enabled: WebGPU/Vulkan disabled, WebGL via EGL/GLES preferred')
+    app.commandLine.appendSwitch('enable-gpu-rasterization')
+    app.commandLine.appendSwitch('use-gl', 'egl-gles2')
+    console.log('React-CarPlay Pi runtime profile enabled: WebGPU/Vulkan disabled, WebGL via EGL/GLES2 preferred')
   } else {
     app.commandLine.appendSwitch('enable-experimental-web-platform-features')
   }
@@ -185,6 +198,9 @@ const initializeServices = () => {
   const defaults = createDefaultConfig(DEFAULT_CONFIG)
   configStore = new ConfigStore(configPath, defaults)
   configStore.load()
+  if (isPiRuntimeProfile()) {
+    configStore.setConfig({ videoRenderer: getPiVideoRenderer() })
+  }
   runtimeControl = new RuntimeControl(configStore)
   socket = new Socket(runtimeControl)
   configureOptionalHardware(runtimeControl.getConfig())

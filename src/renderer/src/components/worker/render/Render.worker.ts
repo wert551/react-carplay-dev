@@ -64,21 +64,30 @@ export class RenderWorker {
   })
 
   init = (event: InitEvent) => {
-    switch (event.renderer) {
-      case 'webgl':
-        this.renderer = new WebGLRenderer(event.canvas)
-        break
-      case 'webgl2':
-        this.renderer = new WebGL2Renderer(event.canvas)
-        break
-      case 'webgpu':
-        if (navigator.gpu) {
-          this.renderer = new WebGPURenderer(event.canvas)
-        } else {
-          console.warn('WebGPU renderer requested but unavailable; falling back to WebGL')
+    try {
+      switch (event.renderer) {
+        case 'webgl':
           this.renderer = new WebGLRenderer(event.canvas)
-        }
-        break
+          break
+        case 'webgl2':
+          this.renderer = new WebGL2Renderer(event.canvas)
+          break
+        case 'webgpu':
+          if (navigator.gpu) {
+            this.renderer = new WebGPURenderer(event.canvas)
+          } else {
+            console.warn('WebGPU renderer requested but unavailable; falling back to WebGL')
+            this.renderer = new WebGLRenderer(event.canvas)
+          }
+          break
+      }
+    } catch (error) {
+      if (event.renderer !== 'webgl') {
+        console.warn(`${event.renderer} renderer unavailable; falling back to WebGL`, error)
+        this.renderer = new WebGLRenderer(event.canvas)
+      } else {
+        throw error
+      }
     }
     this.videoPort = event.videoPort
     this.videoPort.onmessage = ev => {

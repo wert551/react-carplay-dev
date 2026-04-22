@@ -79,7 +79,7 @@ export const createDefaultConfig = (dongleDefaults: DongleConfig): ExtraConfig =
   startMode: 'auto',
   shellMode: 'standalone',
   runtimeEngine: 'browser-webusb',
-  videoRenderer: 'webgl',
+  videoRenderer: 'webgl2',
   showDebugSettings: true,
   bindings: DEFAULT_BINDINGS,
   most: {},
