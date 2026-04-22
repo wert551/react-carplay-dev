@@ -10,7 +10,6 @@ export class WebGPURenderer implements FrameRenderer {
   #started: Promise<void> | null = null
 
   // WebGPU state shared between setup and drawing.
-  #format: GPUTextureFormat | null = null
   #device: GPUDevice | null = null
   #pipeline: GPURenderPipeline | null = null
   #sampler: GPUSampler | null = null
@@ -76,7 +75,6 @@ export class WebGPURenderer implements FrameRenderer {
     }
     this.#device = await adapter.requestDevice()
     const format = gpu.getPreferredCanvasFormat()
-    this.#format = format
 
     if (!this.#canvas) {
       throw Error('Canvas is null')
@@ -149,7 +147,7 @@ export class WebGPURenderer implements FrameRenderer {
           binding: 2,
           resource: this.#device.importExternalTexture({ source: frame }),
         },
-      ] as any, // TODO: fix typing
+      ],
     })
 
     const commandEncoder = this.#device.createCommandEncoder()

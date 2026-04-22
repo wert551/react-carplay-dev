@@ -16,7 +16,7 @@ type NavProps = {
   settings: ExtraConfig | null
 }
 
-export default function Nav({ receivingVideo, settings }: NavProps) {
+export default function Nav({ settings }: NavProps) {
   const [value, setValue] = React.useState(0);
   const [isPlugged] = useStatusStore(state => [state.isPlugged])
   const { pathname } = useLocation()

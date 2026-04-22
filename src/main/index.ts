@@ -33,6 +33,7 @@ const configureChromiumRuntime = () => {
 
   if (isPiRuntimeProfile()) {
     app.commandLine.appendSwitch('disable-features', 'Vulkan,WebGPU')
+    app.commandLine.appendSwitch('ignore-gpu-blocklist')
     app.commandLine.appendSwitch('use-gl', 'egl')
     app.commandLine.appendSwitch('use-angle', 'gles')
     console.log('React-CarPlay Pi runtime profile enabled: WebGPU/Vulkan disabled, WebGL via EGL/GLES preferred')

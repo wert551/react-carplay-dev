@@ -34,12 +34,12 @@ export function KeyBindings({ settings, updateKey }: KeyBindingsProps) {
   const [openWaiting, setOpenWaiting] = useState(false)
 
   useEffect(() => {
-    if(openWaiting) {
-      document.addEventListener('keydown', setKey)
-
-      return () => document.removeEventListener('keydown', setKey)
+    if(!openWaiting) {
+      return undefined
     }
 
+    document.addEventListener('keydown', setKey)
+    return () => document.removeEventListener('keydown', setKey)
   }, [openWaiting, keyToBind]);
 
   const awaitKeyPress = (keyName: keyof KeyBindingConfig) => {
