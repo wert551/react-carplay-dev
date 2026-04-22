@@ -1,0 +1,12 @@
+{
+  "name": "pcm-ringbuf-player",
+  "version": "0.0.5-react-carplay-local",
+  "description": "Local patched pcm-ringbuf-player used by react-carplay without a git prepare step",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "dependencies": {
+    "ringbuf.js": "^0.3.6"
+  }
+}
