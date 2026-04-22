@@ -1,4 +1,4 @@
-import { ExtraConfig } from "../../../main/Globals";
+import { ExtraConfig } from "../../../shared/config";
 import React, { useEffect, useState } from "react";
 import {
   Box,
@@ -89,6 +89,47 @@ function Settings({ settings }: SettingsProps) {
             <FormControlLabel id={'kiosk'}  label={'KIOSK'} control={<Checkbox checked={activeSettings.kiosk} onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
               settingsChange('kiosk', event.target.checked)
             }}/>} />
+          </FormControl>
+        </Grid>
+      )
+    },
+    showDebugSettings: () => {
+      return (
+        <Grid key={'showDebugSettings'} xs={4}>
+          <FormControl>
+            <FormControlLabel id={'showDebugSettings'}  label={'DEBUG SETTINGS UI'} control={<Checkbox checked={activeSettings.showDebugSettings} onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+              settingsChange('showDebugSettings', event.target.checked)
+            }}/>} />
+          </FormControl>
+        </Grid>
+      )
+    },
+    startMode: () => {
+      return (
+        <Grid key={"startMode"} xs={4}>
+          <FormControl>
+            <FormLabel id={"startMode"}>START MODE</FormLabel>
+            <RadioGroup row value={activeSettings.startMode} onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+              settingsChange('startMode', (event.target as HTMLInputElement).value)
+            }}>
+              <FormControlLabel value={'auto'} control={<Radio />} label={'AUTO'} />
+              <FormControlLabel value={'manual'} control={<Radio />} label={'MANUAL'} />
+            </RadioGroup>
+          </FormControl>
+        </Grid>
+      )
+    },
+    shellMode: () => {
+      return (
+        <Grid key={"shellMode"} xs={4}>
+          <FormControl>
+            <FormLabel id={"shellMode"}>SHELL MODE</FormLabel>
+            <RadioGroup row value={activeSettings.shellMode} onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+              settingsChange('shellMode', (event.target as HTMLInputElement).value)
+            }}>
+              <FormControlLabel value={'standalone'} control={<Radio />} label={'STANDALONE'} />
+              <FormControlLabel value={'hosted'} control={<Radio />} label={'HOSTED'} />
+            </RadioGroup>
           </FormControl>
         </Grid>
       )

@@ -8,6 +8,7 @@ import CameraIcon from '@mui/icons-material/Camera';
 import { Link, useLocation } from "react-router-dom";
 import ExitToApp from '@mui/icons-material/ExitToApp';
 import { useStatusStore } from "../store/store";
+import { controlClient } from '../integration/controlClient'
 
 export default function Nav({ receivingVideo, settings }) {
   const [value, setValue] = React.useState(0);
@@ -18,13 +19,13 @@ export default function Nav({ receivingVideo, settings }) {
   };
 
   const quit = () => {
-    window.api.quit()
+    controlClient.quit()
   }
 
   return (
     <Tabs value={value} onChange={handleChange} aria-label="icon label tabs example" centered sx={pathname === '/' && isPlugged ? {minHeight: '0px', height: '0px'} : {}}>
       <Tab icon={<PhoneIcon />} to={'/'} component={Link}/>
-      <Tab icon={<SettingsIcon />} to={'/settings'}  component={Link}/>
+      {settings?.showDebugSettings !== false ? <Tab icon={<SettingsIcon />} to={'/settings'}  component={Link}/> : null}
       <Tab icon={<InfoIcon />} to={'/info'} component={Link}/>
       {settings?.camera !== '' ? <Tab icon={<CameraIcon />} to={'/camera'} component={Link}/> : null}
       <Tab icon={<ExitToApp />} onClick={() => quit()} />

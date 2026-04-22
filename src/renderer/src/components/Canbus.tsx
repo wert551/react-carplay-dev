@@ -1,4 +1,4 @@
-import { CanConfig, CanMessage, ExtraConfig } from "../../../main/Globals";
+import { CanConfig, CanMessage, ExtraConfig } from "../../../shared/config";
 import { Box, Button, Modal, Paper, styled, TextField, Typography } from '@mui/material'
 import Grid from '@mui/material/Unstable_Grid2'
 import React, { useEffect, useState } from "react";

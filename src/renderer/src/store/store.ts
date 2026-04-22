@@ -1,12 +1,20 @@
 import { create } from 'zustand'
-import { ExtraConfig } from "../../../main/Globals";
-import { io } from 'socket.io-client'
+import { ExtraConfig } from "../../../shared/config";
 import { Stream } from "socketmost/dist/modules/Messages";
+import {
+  CarplayStatusUpdate,
+  DEFAULT_STATUS,
+  DesiredSessionState,
+  RuntimeControlCommand,
+  SessionMetadata,
+  SessionState
+} from '../../../shared/control'
+import { controlClient } from '../integration/controlClient'
 
 interface CarplayStore {
   settings: null | ExtraConfig,
-  saveSettings: (settings: ExtraConfig) => void
-  getSettings: () => void
+  saveSettings: (settings: Partial<ExtraConfig>) => Promise<void>
+  getSettings: () => Promise<void>
   stream: (stream: Stream) => void
 }
 
@@ -14,49 +22,84 @@ interface StatusStore {
   reverse: boolean,
   lights: boolean,
   isPlugged: boolean,
+  deviceFound: boolean,
+  receivingVideo: boolean,
+  cameraVisible: boolean,
+  rendererReady: boolean,
+  desiredSession: DesiredSessionState,
+  session: SessionState,
+  lastError: string | null,
+  pendingCommands: RuntimeControlCommand[],
+  activeCommands: RuntimeControlCommand[],
+  metadata: SessionMetadata,
   setPlugged: (plugged: boolean) => void,
   setReverse: (reverse: boolean) => void
+  updateStatus: (status: CarplayStatusUpdate) => void
 }
 
 export const useCarplayStore = create<CarplayStore>()((set) =>({
   settings: null,
-  saveSettings: (settings) => {
-    set(() => ({settings: settings}))
-    socket.emit('saveSettings', settings)
+  saveSettings: async (settings) => {
+    const nextConfig = await controlClient.setConfig(settings)
+    set(() => ({settings: nextConfig}))
   },
-  getSettings: () => {
-    socket.emit('getSettings')
+  getSettings: async () => {
+    const settings = await controlClient.getConfig()
+    set(() => ({settings}))
   },
   stream: (stream) => {
-    socket.emit('stream', stream)
+    controlClient.stream(stream)
   }
 }))
 
 export const useStatusStore = create<StatusStore>()((set) => ({
-  reverse: false,
-  lights: false,
-  isPlugged: false,
+  ...DEFAULT_STATUS,
   setPlugged: (plugged) => {
     set(() => ({isPlugged: plugged}))
+    controlClient.setStatus({ isPlugged: plugged, session: plugged ? 'connected' : 'idle' })
   },
   setReverse: (reverse) => {
     set(() => ({reverse: reverse}))
+    controlClient.setStatus({ reverse, cameraVisible: reverse })
+  },
+  updateStatus: (status) => {
+    set((current) => ({
+      ...status,
+      metadata: {
+        ...current.metadata,
+        ...(status.metadata ?? {})
+      }
+    }))
+    controlClient.setStatus(status)
   }
 }))
 
-const URL = 'http://localhost:4000'
-const socket = io(URL)
-
-socket.on('settings', (settings: ExtraConfig) => {
+controlClient.onConfigChanged((settings: ExtraConfig) => {
   console.log("received settings", settings)
   useCarplayStore.setState(() => ({settings: settings}))
 })
 
-socket.on('reverse', (reverse) => {
-  console.log("reverse data", reverse)
-  useStatusStore.setState(() => ({reverse: reverse}))
+controlClient.onStatusChanged((status) => {
+  console.log("received status", status)
+  useStatusStore.setState((current) => ({
+    ...current,
+    ...status,
+    metadata: {
+      ...current.metadata,
+      ...(status.metadata ?? {})
+    }
+  }))
 })
 
-
-
-
+controlClient.getStatus().then((status) => {
+  useStatusStore.setState((current) => ({
+    ...current,
+    ...status,
+    metadata: {
+      ...current.metadata,
+      ...status.metadata
+    }
+  }))
+}).catch((error) => {
+  console.error('Failed to load CarPlay status', error)
+})

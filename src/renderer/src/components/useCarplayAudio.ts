@@ -16,6 +16,7 @@ const defaultNavVolume = 0.5
 const useCarplayAudio = (
   worker: CarPlayWorker,
   microphonePort: MessagePort,
+  microphoneId?: string,
 ) => {
   const [mic, setMic] = useState<WebMicrophone | null>(null)
   const [audioPlayers] = useState(new Map<AudioPlayerKey, PcmPlayer>())
@@ -72,7 +73,7 @@ const useCarplayAudio = (
     const initMic = async () => {
       try {
         const mediaStream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
+          audio: microphoneId ? { deviceId: microphoneId } : true,
         })
         const mic = new WebMicrophone(mediaStream, microphonePort)
         setMic(mic)
@@ -86,7 +87,7 @@ const useCarplayAudio = (
     return () => {
       audioPlayers.forEach(p => p.stop())
     }
-  }, [audioPlayers, worker, microphonePort])
+  }, [audioPlayers, worker, microphonePort, microphoneId])
 
   const startRecording = useCallback(() => {
     mic?.start()

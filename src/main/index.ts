@@ -3,85 +3,30 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { DEFAULT_CONFIG } from 'node-carplay/node'
 import { Socket } from './Socket'
-import * as fs from 'fs';
 
 // comment below line to allow running on non linux devices
 import {Canbus} from "./Canbus"
 
-import { ExtraConfig, KeyBindings } from "./Globals";
+import { ExtraConfig, createDefaultConfig } from '../shared/config'
+import { CarplayStatusUpdate, CONTROL_CHANNELS, SessionAdapterEvent } from '../shared/control'
+import { ConfigStore } from './ConfigStore'
+import { RuntimeControl } from './RuntimeControl'
+import { PiMost } from './PiMost'
 // import CarplayNode, {DEFAULT_CONFIG, CarplayMessage} from "node-carplay/node";
 
 let mainWindow: BrowserWindow
-const appPath: string = app.getPath('userData')
-const configPath: string = appPath + '/config.json'
-console.log(configPath)
-let config: null | ExtraConfig
-
-const DEFAULT_BINDINGS: KeyBindings = {
-  left: 'ArrowLeft',
-  right: 'ArrowRight',
-  selectDown: 'Space',
-  back: 'Backspace',
-  down: 'ArrowDown',
-  home: 'KeyH',
-  play: 'KeyP',
-  pause: 'KeyO',
-  next: 'KeyM',
-  prev: 'KeyN'
-}
-
-const EXTRA_CONFIG: ExtraConfig = {
-  ...DEFAULT_CONFIG,
-  kiosk: true,
-  camera: '',
-  microphone: '',
-  piMost: false,
-  canbus: false,
-  bindings: DEFAULT_BINDINGS,
-  most: {},
-  canConfig: {}
-}
+let configStore: ConfigStore
+let runtimeControl: RuntimeControl
 
 // comment below line to allow running on non linux devices
-let canbus: null | Canbus
+let canbus: null | Canbus = null
+let piMost: null | PiMost = null
 
-let socket: null | Socket
-
-fs.exists(configPath, (exists) => {
-    if(exists) {
-      config = JSON.parse(fs.readFileSync(configPath).toString())
-      let configKeys = JSON.stringify(Object.keys({...config}).sort())
-      let defaultKeys =  JSON.stringify(Object.keys({...EXTRA_CONFIG}).sort())
-      if(configKeys !== defaultKeys) {
-        console.log("config updating")
-        config = {...EXTRA_CONFIG, ...config}
-        console.log("new config", config)
-        fs.writeFileSync(configPath, JSON.stringify(config))
-      }
-      console.log("config read")
-    } else {
-      fs.writeFileSync(configPath, JSON.stringify(EXTRA_CONFIG))
-      config = JSON.parse(fs.readFileSync(configPath).toString())
-      console.log("config created and read")
-    }
-    socket = new Socket(config!, saveSettings)
-    // comment below if statement to allow running on non linux devices
-    if(config!.canbus) {
-      console.log("Configuring can", config!.canConfig)
-      canbus = new Canbus('can0',  socket, config!.canConfig)
-      canbus.on('lights', (data) => {
-        console.log('lights', data)
-      })
-      canbus.on('reverse', (data) => {
-        mainWindow?.webContents?.send('reverse', data)
-      })
-    }
-
-})
+let socket: null | Socket = null
 
 const handleSettingsReq = (_: IpcMainEvent ) => {
   console.log("settings request")
-  mainWindow?.webContents.send('settings', config)
+  mainWindow?.webContents.send('settings', runtimeControl.getConfig())
 }
 
 
@@ -89,11 +34,12 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('disable-webusb-security', 'true')
 console.log(app.commandLine.hasSwitch('disable-webusb-security'))
 function createWindow(): void {
+  const config = runtimeControl.getConfig()
   // Create the browser window.
   mainWindow = new BrowserWindow({
-    width: config!.width,
-    height: config!.height,
-    kiosk: config!.kiosk,
+    width: config.width,
+    height: config.height,
+    kiosk: config.kiosk,
     show: false,
     frame: false,
     autoHideMenuBar: true,
@@ -105,6 +51,7 @@ function createWindow(): void {
       webSecurity: false
     }
   })
+  runtimeControl.attachRenderer(mainWindow.webContents)
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
   // mainWindow.webContents.session.setDevicePermissionHandler((details) => {
@@ -174,6 +121,7 @@ function createWindow(): void {
 app.commandLine.appendSwitch('enable-experimental-web-platform-features');
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required")
 app.whenReady().then(() => {
+  initializeServices()
 
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.electron')
@@ -196,13 +144,7 @@ app.whenReady().then(() => {
     })
   })
 
-  ipcMain.on('getSettings', handleSettingsReq)
-
-  ipcMain.on('saveSettings', saveSettings)
-
-  // ipcMain.on('startStream', startMostStream)
-
-  ipcMain.on('quit', quit)
+  registerIpcHandlers()
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
@@ -220,11 +162,70 @@ app.whenReady().then(() => {
   })
 })
 
-const saveSettings = (settings: ExtraConfig) => {
+const initializeServices = () => {
+  const configPath = join(app.getPath('userData'), 'config.json')
+  const defaults = createDefaultConfig(DEFAULT_CONFIG)
+  configStore = new ConfigStore(configPath, defaults)
+  configStore.load()
+  runtimeControl = new RuntimeControl(configStore)
+  socket = new Socket(runtimeControl)
+  configureOptionalHardware(runtimeControl.getConfig())
+  runtimeControl.on('configChanged', (config: ExtraConfig) => {
+    configureOptionalHardware(config)
+  })
+  console.log(`React-CarPlay config path: ${configStore.getConfigPath()}`)
+}
+
+const configureOptionalHardware = (config: ExtraConfig) => {
+  if (config.piMost && !piMost) {
+    piMost = new PiMost(runtimeControl)
+  }
+
+  // comment below if statement to allow running on non linux devices
+  if (config.canbus && !canbus && socket) {
+    console.log("Configuring can", config.canConfig)
+    canbus = new Canbus('can0', socket, config.canConfig)
+    canbus.on('lights', (data) => {
+      console.log('lights', data)
+    })
+  }
+}
+
+const registerIpcHandlers = () => {
+  ipcMain.on('getSettings', handleSettingsReq)
+  ipcMain.on('saveSettings', saveSettings)
+  ipcMain.on('quit', quit)
+
+  ipcMain.handle(CONTROL_CHANNELS.getConfig, () => runtimeControl.getConfig())
+  ipcMain.handle(CONTROL_CHANNELS.setConfig, (_, settings: Partial<ExtraConfig>) => {
+    return runtimeControl.setConfig(settings)
+  })
+  ipcMain.handle(CONTROL_CHANNELS.validateConfig, (_, settings: Partial<ExtraConfig>) => {
+    return runtimeControl.validateConfig(settings)
+  })
+  ipcMain.handle(CONTROL_CHANNELS.getStatus, () => runtimeControl.getStatus())
+  ipcMain.handle(CONTROL_CHANNELS.setStatus, (_, status: CarplayStatusUpdate) => {
+    return runtimeControl.setStatus(status)
+  })
+  ipcMain.handle(CONTROL_CHANNELS.startSession, () => runtimeControl.startSession())
+  ipcMain.handle(CONTROL_CHANNELS.stopSession, () => runtimeControl.stopSession())
+  ipcMain.handle(CONTROL_CHANNELS.restartSession, () => runtimeControl.restartSession())
+  ipcMain.handle(CONTROL_CHANNELS.showCamera, (_, visible?: boolean) => {
+    return runtimeControl.showCamera(visible)
+  })
+  ipcMain.handle(CONTROL_CHANNELS.sessionAdapterReady, () => runtimeControl.sessionAdapterReady())
+  ipcMain.handle(CONTROL_CHANNELS.reportSessionEvent, (_, event: SessionAdapterEvent) => {
+    return runtimeControl.reportSessionEvent(event)
+  })
+  ipcMain.on(CONTROL_CHANNELS.stream, (_, stream) => {
+    runtimeControl.stream(stream)
+  })
+  ipcMain.on(CONTROL_CHANNELS.quit, quit)
+}
+
+const saveSettings = (_: IpcMainEvent, settings: ExtraConfig) => {
   console.log("saving settings", settings)
-  fs.writeFileSync(configPath, JSON.stringify(settings))
-  app.relaunch()
-  app.exit()
+  runtimeControl.setConfig(settings)
 }
 
 // const startMostStream = (_: IpcMainEvent, most: Stream) => {

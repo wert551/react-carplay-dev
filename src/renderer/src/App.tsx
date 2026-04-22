@@ -27,11 +27,13 @@ const style = {
 };
 
 function App() {
-  const [receivingVideo, setReceivingVideo] = useState(false)
   const [commandCounter, setCommandCounter] = useState(0)
   const [keyCommand, setKeyCommand] = useState('')
-  const [reverse, setReverse] = useStatusStore(state => [state.reverse, state.setReverse])
+  const [reverse, setReverse, receivingVideo] = useStatusStore(state => [state.reverse, state.setReverse, state.receivingVideo])
   const settings = useCarplayStore((state) => state.settings)
+  const getSettings = useCarplayStore((state) => state.getSettings)
+  const isHosted = settings?.shellMode === 'hosted'
+  const showDebugSettings = settings?.showDebugSettings !== false
 
   const prefersDarkMode = useMediaQuery('(prefers-color-scheme: dark)');
 
@@ -42,6 +44,10 @@ function App() {
   });
 
   useEffect(() => {
+    getSettings()
+  }, [getSettings])
+
+  useEffect(() => {
     document.addEventListener('keydown', onKeyDown)
 
     return () => document.removeEventListener('keydown', onKeyDown)
@@ -49,9 +55,10 @@ function App() {
 
 
   const onKeyDown = (event: KeyboardEvent) => {
-    if(Object.values(settings!.bindings).includes(event.code)) {
-      let action = Object.keys(settings!.bindings).find(key =>
-        settings!.bindings[key] === event.code
+    if(!settings) return
+    if(Object.values(settings.bindings).includes(event.code)) {
+      let action = Object.keys(settings.bindings).find(key =>
+        settings.bindings[key] === event.code
       )
       console.log(action)
       if(action !== undefined) {
@@ -77,13 +84,13 @@ function App() {
           className="App"
 
         >
-          <Nav receivingVideo={receivingVideo} settings={settings}/>
-          {settings ? <Carplay  receivingVideo={receivingVideo} setReceivingVideo={setReceivingVideo} settings={settings} command={keyCommand} commandCounter={commandCounter}/> : null}
+          {!isHosted ? <Nav receivingVideo={receivingVideo} settings={settings}/> : null}
+          {settings ? <Carplay settings={settings} command={keyCommand} commandCounter={commandCounter}/> : null}
           <Routes>
             <Route path={"/"} element={<Home />} />
-            <Route path={"/settings"} element={<Settings settings={settings!}/>} />
-            <Route path={"/info"} element={<Info />} />
-            <Route path={"/camera"} element={<Camera settings={settings!}/>} />
+            <Route path={"/settings"} element={settings && showDebugSettings ? <Settings settings={settings}/> : null} />
+            <Route path={"/info"} element={!isHosted ? <Info /> : null} />
+            <Route path={"/camera"} element={<Camera settings={settings}/>} />
           </Routes>
           <Modal
             open={reverse}

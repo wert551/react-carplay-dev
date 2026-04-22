@@ -7,8 +7,9 @@ const Camera = ({settings}) => {
   console.log(settings)
 
   useEffect(() => {
+    if(!settings) return
     getVideo();
-  }, [videoRef]);
+  }, [videoRef, settings]);
 
   const getVideo = () => {
     navigator.mediaDevices

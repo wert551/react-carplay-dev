@@ -1,18 +1,18 @@
 import { SocketMost, SocketMostClient } from 'socketmost'
 import { Stream } from "socketmost/dist/modules/Messages";
-import { MessageNames, Socket } from "./Socket";
+import { RuntimeControl } from './RuntimeControl'
 
 export class PiMost {
   socketMost: SocketMost
   socketMostClient: SocketMostClient
-  socket: Socket
-  constructor(socket: Socket) {
+  control: RuntimeControl
+  constructor(control: RuntimeControl) {
     console.log("creating client in PiMost")
     this.socketMost = new SocketMost()
     this.socketMostClient = new SocketMostClient()
-    this.socket = socket
+    this.control = control
 
-    this.socket.on(MessageNames.Stream, (stream) => {
+    this.control.on('stream', (stream) => {
       this.stream(stream)
     })
   }

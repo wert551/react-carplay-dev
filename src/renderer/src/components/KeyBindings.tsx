@@ -1,4 +1,4 @@
-import { ExtraConfig } from "../../../main/Globals";
+import { ExtraConfig } from "../../../shared/config";
 import { Box, Button, Modal, Paper, styled, Typography } from "@mui/material";
 import Grid from '@mui/material/Unstable_Grid2'
 import { useEffect, useState } from "react";
