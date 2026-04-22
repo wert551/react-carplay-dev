@@ -2,6 +2,14 @@ import { resolve } from 'path'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import { NodeGlobalsPolyfillPlugin } from '@esbuild-plugins/node-globals-polyfill'
+import type { UserConfig as ViteUserConfig } from 'vite'
+
+type OptimizeDepsPlugin = NonNullable<NonNullable<NonNullable<ViteUserConfig['optimizeDeps']>['esbuildOptions']>['plugins']>[number]
+
+const nodeGlobalsPolyfillPlugin = NodeGlobalsPolyfillPlugin({
+  process: true,
+  buffer: true
+}) as unknown as OptimizeDepsPlugin
 
 export default defineConfig({
   main: {
@@ -24,10 +32,7 @@ export default defineConfig({
           global: 'globalThis'
         },
         plugins: [
-          NodeGlobalsPolyfillPlugin({
-            process: true,
-            buffer: true
-          })
+          nodeGlobalsPolyfillPlugin
         ]
       }
     },

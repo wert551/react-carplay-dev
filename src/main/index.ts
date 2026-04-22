@@ -107,7 +107,9 @@ function createWindow(): void {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-  systemPreferences.askForMediaAccess("microphone")
+  if (process.platform === 'darwin' && typeof systemPreferences.askForMediaAccess === 'function') {
+    systemPreferences.askForMediaAccess("microphone")
+  }
   mainWindow.webContents.session.webRequest.onHeadersReceived((details, callback) => {
     details.responseHeaders!['Cross-Origin-Opener-Policy'] = ['same-origin'];
     details.responseHeaders!['Cross-Origin-Embedder-Policy'] = ['require-corp'];

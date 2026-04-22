@@ -10,9 +10,14 @@ type CanMask = {
   invert: boolean
 }
 
+type CanChannel = ReturnType<typeof can.createRawChannel>
+type CanFrame = {
+  id: number,
+  data: ArrayLike<number>
+}
 
 export class Canbus extends EventEmitter {
-  channel: can.channel
+  channel: CanChannel
   canChannel: string
   subscriptions: CanConfig
   masks: CanMask[]
@@ -28,17 +33,23 @@ export class Canbus extends EventEmitter {
     this.reverse = false
     this.lights = false
     this.socket = socket
-    Object.keys(this.subscriptions).forEach((sub) => {
-      this.masks.push({id: this.subscriptions[sub].canId, mask: this.subscriptions[sub].canId, invert: false})
+    ;(Object.keys(this.subscriptions) as Array<keyof CanConfig>).forEach((sub) => {
+      const subscription = this.subscriptions[sub]
+      if(subscription) {
+        this.masks.push({id: subscription.canId, mask: subscription.canId, invert: false})
+      }
     })
     console.log(this.masks)
     this.channel.setRxFilters(this.masks)
 
-    this.channel.addListener("onMessage", (msg) => {
+    this.channel.addListener("onMessage", (msg: CanFrame) => {
       let data
       switch (msg.id) {
         case this.subscriptions?.reverse?.canId:
-          data = msg.data[this.subscriptions!.reverse!.byte] & this.subscriptions!.reverse!.mask
+          if (!this.subscriptions.reverse) {
+            break
+          }
+          data = msg.data[this.subscriptions.reverse.byte] & this.subscriptions.reverse.mask
           console.log("reverse", data)
           let tempReverse
           if (data) {
@@ -52,15 +63,19 @@ export class Canbus extends EventEmitter {
           }
           break
         case this.subscriptions?.lights?.canId:
+          if (!this.subscriptions.lights) {
+            break
+          }
           let tempLights = this.lights
-          data = msg.data[this.subscriptions!.reverse!.byte] & this.subscriptions!.reverse!.mask
+          data = msg.data[this.subscriptions.lights.byte] & this.subscriptions.lights.mask
           if (data) {
             tempLights = true
           } else {
             tempLights = false
           }
           if(tempLights !== this.lights) {
-            this.socket.sendLights(this.lights)
+            this.socket.sendLights(tempLights)
+            this.lights = tempLights
           }
           break
       }
