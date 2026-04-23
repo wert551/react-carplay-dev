@@ -3,6 +3,7 @@
 const fs = require('node:fs')
 const crypto = require('node:crypto')
 const http = require('node:http')
+const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
 const { Server } = require('socket.io')
@@ -11,6 +12,8 @@ const DONGLE_VENDOR_ID = 0x1314
 const DONGLE_PRODUCT_IDS = new Set([0x1520, 0x1521])
 const HOST = process.env.CARPLAY_NATIVE_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.CARPLAY_NATIVE_PORT ?? 4100)
+const VIDEO_STREAM_HOST = process.env.CARPLAY_NATIVE_VIDEO_HOST ?? HOST
+const VIDEO_STREAM_PORT = Number(process.env.CARPLAY_NATIVE_VIDEO_PORT ?? PORT + 1)
 const CONFIG_PATH =
   process.env.CARPLAY_NATIVE_CONFIG ?? path.join(os.homedir(), '.config', 'react-carplay', 'config.json')
 const START_RETRY_LIMIT = Number(process.env.CARPLAY_NATIVE_START_RETRIES ?? 2)
@@ -51,7 +54,9 @@ let config = null
 let startPromise = null
 let stopPromise = null
 let httpServer = null
+let videoStreamServer = null
 let stopping = false
+let videoFrameSequence = 0
 
 const status = {
   desiredSession: 'stopped',
@@ -93,7 +98,10 @@ const videoDiagnostics = {
   hasSps: false,
   hasPps: false,
   lastPayloadBytes: 0,
-  lastNalTypes: []
+  lastNalTypes: [],
+  binaryPacketsSent: 0,
+  binaryBytesSent: 0,
+  binaryClients: 0
 }
 
 const now = () => new Date().toISOString()
@@ -105,6 +113,7 @@ const io = new Server({
   }
 })
 const wsClients = new Set()
+const videoStreamClients = new Set()
 
 const sendWebSocketFrame = (socket, payload) => {
   if (socket.destroyed) return
@@ -167,6 +176,19 @@ const emitRuntimeMessage = (message) => {
   io.emit('runtimeMessage', message)
   emitWebSocketEvent('runtimeMessage', message)
 }
+
+const getVideoStreamStatus = () => ({
+  binaryStreamAvailable: Boolean(videoStreamServer?.listening),
+  transport: 'tcp',
+  streamUrl: `tcp://${VIDEO_STREAM_HOST}:${VIDEO_STREAM_PORT}`,
+  host: VIDEO_STREAM_HOST,
+  port: VIDEO_STREAM_PORT,
+  packetFormat: 'CPV1',
+  packetHeaderBytes: 20,
+  connectedClients: videoStreamClients.size,
+  totalPacketsSent: videoDiagnostics.binaryPacketsSent,
+  totalBytesSent: videoDiagnostics.binaryBytesSent
+})
 
 const setStatus = (update) => {
   Object.assign(status, update)
@@ -537,7 +559,10 @@ const resetVideoDiagnostics = () => {
     hasSps: false,
     hasPps: false,
     lastPayloadBytes: 0,
-    lastNalTypes: []
+    lastNalTypes: [],
+    binaryPacketsSent: videoDiagnostics.binaryPacketsSent,
+    binaryBytesSent: videoDiagnostics.binaryBytesSent,
+    binaryClients: videoStreamClients.size
   })
 }
 
@@ -556,7 +581,7 @@ const getVideoStatus = () => ({
   hasPps: videoDiagnostics.hasPps,
   lastPayloadBytes: videoDiagnostics.lastPayloadBytes,
   lastNalTypes: videoDiagnostics.lastNalTypes,
-  binaryStreamAvailable: false
+  ...getVideoStreamStatus()
 })
 
 const updateVideoDiagnostics = (message) => {
@@ -569,7 +594,7 @@ const updateVideoDiagnostics = (message) => {
 
   if (!data) {
     videoDiagnostics.lastPayloadBytes = 0
-    return
+    return null
   }
 
   videoDiagnostics.lastPayloadBytes = data.byteLength
@@ -598,6 +623,89 @@ const updateVideoDiagnostics = (message) => {
   }
 
   videoDiagnostics.lastNalTypes = nalTypes.slice(0, 12)
+  return {
+    data,
+    nalTypes,
+    hasKeyframe: nalTypes.includes(H264_NAL_TYPES.IDR),
+    hasConfig: nalTypes.includes(H264_NAL_TYPES.SPS) || nalTypes.includes(H264_NAL_TYPES.PPS),
+    observedAt
+  }
+}
+
+const writeVideoPacket = (socket, payload, flags, pts) => {
+  const header = Buffer.alloc(20)
+  header.write('CPV1', 0, 4, 'ascii')
+  header.writeUInt16BE(1, 4)
+  header.writeUInt16BE(flags, 6)
+  header.writeBigUInt64BE(pts, 8)
+  header.writeUInt32BE(payload.byteLength, 16)
+  socket.write(Buffer.concat([header, payload]))
+}
+
+const broadcastVideoAccessUnit = (videoInfo) => {
+  if (!videoInfo?.data || videoStreamClients.size === 0) return
+
+  const payload = Buffer.from(videoInfo.data.buffer, videoInfo.data.byteOffset, videoInfo.data.byteLength)
+  const flags = (videoInfo.hasKeyframe ? 1 : 0) | (videoInfo.hasConfig ? 2 : 0)
+  const pts = process.hrtime.bigint() / 1000n
+  videoFrameSequence += 1
+
+  for (const socket of videoStreamClients) {
+    try {
+      writeVideoPacket(socket, payload, flags, pts)
+    } catch (error) {
+      log('runtimeMessage', {
+        type: 'videoStreamWriteError',
+        error: getErrorMessage(error)
+      })
+      videoStreamClients.delete(socket)
+      socket.destroy()
+    }
+  }
+
+  videoDiagnostics.binaryPacketsSent += 1
+  videoDiagnostics.binaryBytesSent += payload.byteLength
+  videoDiagnostics.binaryClients = videoStreamClients.size
+}
+
+const startVideoStreamServer = () => {
+  videoStreamServer = net.createServer((socket) => {
+    socket.setNoDelay(true)
+    videoStreamClients.add(socket)
+    videoDiagnostics.binaryClients = videoStreamClients.size
+    log('videoStreamClientConnected', {
+      clients: videoStreamClients.size,
+      remoteAddress: socket.remoteAddress,
+      remotePort: socket.remotePort
+    })
+
+    socket.on('close', () => {
+      videoStreamClients.delete(socket)
+      videoDiagnostics.binaryClients = videoStreamClients.size
+      log('videoStreamClientDisconnected', {
+        clients: videoStreamClients.size
+      })
+    })
+    socket.on('error', (error) => {
+      videoStreamClients.delete(socket)
+      videoDiagnostics.binaryClients = videoStreamClients.size
+      log('videoStreamClientError', {
+        error: getErrorMessage(error)
+      })
+    })
+  })
+
+  videoStreamServer.on('error', (error) => {
+    log('sessionError', {
+      source: 'videoStream',
+      error: getErrorMessage(error),
+      diagnostic: `Unable to listen on ${VIDEO_STREAM_HOST}:${VIDEO_STREAM_PORT}`
+    })
+  })
+
+  videoStreamServer.listen(VIDEO_STREAM_PORT, VIDEO_STREAM_HOST, () => {
+    log('videoStreamListening', getVideoStreamStatus())
+  })
 }
 
 const loadDependencies = () => {
@@ -868,7 +976,7 @@ const attachMessageHandler = () => {
             deviceFound: true
           })
         }
-        updateVideoDiagnostics(message?.message)
+        broadcastVideoAccessUnit(updateVideoDiagnostics(message?.message))
         setStatus({ receivingVideo: true })
         emitRuntimeMessage({ type, message: summarize(message?.message) })
         break
@@ -1369,8 +1477,13 @@ const shutdown = async () => {
     socket.end()
   }
   wsClients.clear()
+  for (const socket of videoStreamClients) {
+    socket.end()
+  }
+  videoStreamClients.clear()
   io.close()
   httpServer?.close()
+  videoStreamServer?.close()
 }
 
 const main = async () => {
@@ -1386,6 +1499,7 @@ const main = async () => {
   })
   io.attach(httpServer)
   httpServer.listen(PORT, HOST)
+  startVideoStreamServer()
   emitConfig()
   emitStatus()
 
@@ -1395,6 +1509,7 @@ const main = async () => {
     httpBaseUrl: `http://${HOST}:${PORT}`,
     webSocketUrl: `ws://${HOST}:${PORT}/events`,
     socketIoUrl: `http://${HOST}:${PORT}`,
+    videoStreamUrl: `tcp://${VIDEO_STREAM_HOST}:${VIDEO_STREAM_PORT}`,
     configPath: CONFIG_PATH,
     autoStart: AUTO_START
   })
