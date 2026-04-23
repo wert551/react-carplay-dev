@@ -113,12 +113,19 @@ Optional environment variables:
 
 - `CARPLAY_PROBE_TIMEOUT_MS=120000`: Stop the probe automatically after two minutes.
 - `CARPLAY_PROBE_CONFIG=/path/to/config.json`: Overlay a specific JSON config file on top of `node-carplay/node`'s `DEFAULT_CONFIG`.
+- `CARPLAY_PROBE_START_RETRIES=2`: Retry native startup after a reset/re-enumeration failure.
+- `CARPLAY_PROBE_REDISCOVERY_TIMEOUT_MS=15000`: Maximum time to wait for the dongle to reappear after reset.
+- `CARPLAY_PROBE_POLL_INTERVAL_MS=1000`: Dongle polling interval.
 
 The probe logs JSON lines with lifecycle names that match the runtime session model:
 
 - `waitingForDongle`
 - `dongleFound`
 - `waitingForPhone`
+- `resetStarted`
+- `resetLostDevice`
+- `dongleRediscovered`
+- `startRetried`
 - `phoneConnected`
 - `phoneDisconnected`
 - `sessionStopped`
@@ -128,6 +135,8 @@ Interpretation:
 
 - If it reaches `dongleFound`, native USB enumeration is working outside Chromium.
 - If it reaches `phoneConnected`, a non-browser session runtime is viable enough to become the next external runtime-service candidate.
+- If startup fails with `LIBUSB_ERROR_NOT_FOUND` during `WebUSBDevice.reset(...)`, the probe treats that as reset/re-enumeration, waits for the dongle to return, creates a fresh native runtime instance, and retries startup.
+- If reset recovery still fails after retries, the likely patch point is inside `node-carplay/node` startup: the native path needs to rediscover/reopen the dongle after reset rather than continuing with a stale device reference.
 - If it logs `sessionError` saying no usable native constructor or no `start()` method exists, the installed `node-carplay/node` package is not currently a complete drop-in runtime and needs a wrapper, patch, or replacement native executor before Qt can control it as the active backend.
 - If it can start but media frames/audio are not exposed in a native-friendly way, session ownership may be viable while video/audio transport remains the next missing contract.
 

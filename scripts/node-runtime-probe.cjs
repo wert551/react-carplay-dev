@@ -7,6 +7,9 @@ const path = require('node:path')
 const DONGLE_VENDOR_ID = 0x1314
 const DONGLE_PRODUCT_IDS = new Set([0x1520, 0x1521])
 const DEFAULT_TIMEOUT_MS = Number(process.env.CARPLAY_PROBE_TIMEOUT_MS ?? 0)
+const START_RETRY_LIMIT = Number(process.env.CARPLAY_PROBE_START_RETRIES ?? 2)
+const DONGLE_REDISCOVERY_TIMEOUT_MS = Number(process.env.CARPLAY_PROBE_REDISCOVERY_TIMEOUT_MS ?? 15000)
+const DONGLE_POLL_INTERVAL_MS = Number(process.env.CARPLAY_PROBE_POLL_INTERVAL_MS ?? 1000)
 
 let nativeModule = null
 let usbModule = null
@@ -18,6 +21,53 @@ const now = () => new Date().toISOString()
 
 const log = (event, details = {}) => {
   console.log(JSON.stringify({ timestamp: now(), event, ...details }))
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const formatDevice = (dongle) => {
+  if (!dongle?.deviceDescriptor) return {}
+  return {
+    vendorId: `0x${dongle.deviceDescriptor.idVendor.toString(16)}`,
+    productId: `0x${dongle.deviceDescriptor.idProduct.toString(16)}`,
+    busNumber: dongle.busNumber,
+    deviceAddress: dongle.deviceAddress
+  }
+}
+
+const getErrorMessage = (error) => {
+  if (error instanceof Error) return error.message
+  return String(error)
+}
+
+const getErrorStack = (error) => {
+  if (error instanceof Error) return error.stack
+  return undefined
+}
+
+const isResetLostDeviceError = (error) => {
+  const message = getErrorMessage(error)
+  const stack = getErrorStack(error) ?? ''
+  return (
+    /LIBUSB_ERROR_NOT_FOUND/i.test(message) ||
+    /LIBUSB_ERROR_NO_DEVICE/i.test(message) ||
+    (/reset/i.test(message) && /not_found|no_device|device/i.test(message)) ||
+    /WebUSBDevice\.reset/i.test(stack)
+  )
+}
+
+const getStartupFailureDiagnostic = (error, recoverableResetError) => {
+  const message = getErrorMessage(error)
+  if (recoverableResetError) {
+    return 'The dongle vanished during reset or node-carplay/node kept a stale device reference. Waiting for re-enumeration and retrying with a new runtime instance.'
+  }
+  if (/LIBUSB_ERROR_BUSY|busy|access/i.test(message)) {
+    return 'The dongle may be owned by another process. Stop Electron/dev sessions and check for other node/electron processes before rerunning the probe.'
+  }
+  if (/permission|denied|LIBUSB_ERROR_ACCESS/i.test(message)) {
+    return 'USB permissions may be blocking native access. Check udev rules, group membership, and whether the probe is running with the same permissions as the working Pi Electron path.'
+  }
+  return 'Native startup failed for a reason that is not recognized as reset/re-enumeration.'
 }
 
 const summarize = (value) => {
@@ -133,8 +183,10 @@ const findDongle = () => {
   }) ?? null
 }
 
-const waitForDongle = async () => {
-  log('waitingForDongle')
+const waitForDongle = async ({ rediscovery = false, timeoutMs = 0 } = {}) => {
+  log(rediscovery ? 'resetLostDevice' : 'waitingForDongle', {
+    timeoutMs: timeoutMs || undefined
+  })
 
   if (!usbModule?.getDeviceList) {
     log('probeWarning', {
@@ -147,16 +199,29 @@ const waitForDongle = async () => {
   while (!stopping) {
     const dongle = findDongle()
     if (dongle) {
-      log('dongleFound', {
+      log(rediscovery ? 'dongleRediscovered' : 'dongleFound', {
         elapsedMs: Date.now() - startedAt,
-        vendorId: `0x${dongle.deviceDescriptor.idVendor.toString(16)}`,
-        productId: `0x${dongle.deviceDescriptor.idProduct.toString(16)}`
+        ...formatDevice(dongle)
       })
       return dongle
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+    if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+      return null
+    }
+    await delay(DONGLE_POLL_INTERVAL_MS)
   }
   return null
+}
+
+const safeStopCarplay = async (reason) => {
+  if (!carplay || typeof carplay.stop !== 'function') return
+  try {
+    await carplay.stop()
+  } catch (error) {
+    log('probeWarning', {
+      warning: `Ignoring stop() failure while recovering from ${reason}: ${getErrorMessage(error)}`
+    })
+  }
 }
 
 const startCarplay = async (dongle) => {
@@ -173,6 +238,86 @@ const startCarplay = async (dongle) => {
     expectedArgs: carplay.start.length
   })
   return carplay.start()
+}
+
+const createRuntime = (NativeCarplay, config) => {
+  carplay = new NativeCarplay(config)
+  attachMessageHandler()
+  if (typeof carplay.start !== 'function') {
+    log('sessionError', {
+      error: 'Native runtime instance does not expose start()',
+      instanceKeys: Object.keys(carplay)
+    })
+    process.exitCode = 2
+    return false
+  }
+  return true
+}
+
+const startWithResetRecovery = async (NativeCarplay, config, initialDongle) => {
+  let dongle = initialDongle
+
+  for (let attempt = 0; attempt <= START_RETRY_LIMIT && !stopping; attempt += 1) {
+    if (attempt > 0) {
+      log('startRetried', {
+        attempt,
+        maxRetries: START_RETRY_LIMIT
+      })
+    }
+
+    if (!createRuntime(NativeCarplay, config)) return false
+
+    try {
+      log('resetStarted', {
+        attempt,
+        note: 'node-carplay/node performs dongle reset during start; LIBUSB_ERROR_NOT_FOUND usually means the device disappeared and may re-enumerate'
+      })
+      await startCarplay(dongle)
+      log('nativeStartReturned')
+      return true
+    } catch (error) {
+      const recoverableResetError = isResetLostDeviceError(error)
+      log(recoverableResetError ? 'resetLostDevice' : 'sessionError', {
+        attempt,
+        error: getErrorMessage(error),
+        stack: getErrorStack(error),
+        diagnostic: getStartupFailureDiagnostic(error, recoverableResetError)
+      })
+
+      await safeStopCarplay('failed start')
+      carplay = null
+
+      if (!recoverableResetError || attempt >= START_RETRY_LIMIT) {
+        if (recoverableResetError) {
+          log('sessionError', {
+            error: 'Native startup did not recover after dongle reset/re-enumeration retries',
+            recommendation:
+              'Patch node-carplay/node around WebUSBDevice.reset/startup to rediscover the device after reset instead of reusing the stale device handle.'
+          })
+        }
+        process.exitCode = 1
+        return false
+      }
+
+      dongle = await waitForDongle({
+        rediscovery: true,
+        timeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS
+      })
+
+      if (!dongle) {
+        log('sessionError', {
+          error: 'Dongle did not reappear after reset',
+          timeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS,
+          diagnostic:
+            'If the dongle remains missing, check USB power, cable, kernel logs, permissions, and whether another process such as Electron still owns the device.'
+        })
+        process.exitCode = 1
+        return false
+      }
+    }
+  }
+
+  return false
 }
 
 const mapMessageToEvent = (message) => {
@@ -220,9 +365,9 @@ const attachMessageHandler = () => {
     ;['message', 'plugged', 'unplugged', 'failure', 'error', 'video', 'audio'].forEach((eventName) => {
       carplay.on(eventName, (payload) => {
         if (eventName === 'error') {
-          log('sessionError', {
-            error: payload instanceof Error ? payload.message : String(payload)
-          })
+      log('sessionError', {
+        error: getErrorMessage(payload)
+      })
           return
         }
         mapMessageToEvent({ type: eventName, message: payload })
@@ -245,7 +390,9 @@ const startNativeRuntime = async () => {
   const config = getConfig()
   log('nativeRuntimeCandidate', {
     constructorName: NativeCarplay.name || '(anonymous)',
-    configKeys: Object.keys(config).sort()
+    configKeys: Object.keys(config).sort(),
+    startRetryLimit: START_RETRY_LIMIT,
+    rediscoveryTimeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS
   })
 
   const dongle = await waitForDongle()
@@ -253,24 +400,11 @@ const startNativeRuntime = async () => {
 
   log('waitingForPhone')
   try {
-    carplay = new NativeCarplay(config)
-    attachMessageHandler()
-    if (typeof carplay.start !== 'function') {
-      log('sessionError', {
-        error: 'Native runtime instance does not expose start()',
-        instanceKeys: Object.keys(carplay)
-      })
-      process.exitCode = 2
-      return false
-    }
-
-    await startCarplay(dongle)
-    log('nativeStartReturned')
-    return true
+    return startWithResetRecovery(NativeCarplay, config, dongle)
   } catch (error) {
     log('sessionError', {
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined
+      error: getErrorMessage(error),
+      stack: getErrorStack(error)
     })
     process.exitCode = 1
     return false
@@ -287,7 +421,7 @@ const stopNativeRuntime = async () => {
     log('sessionStopped')
   } catch (error) {
     log('sessionError', {
-      error: `Failed to stop native runtime: ${error instanceof Error ? error.message : String(error)}`
+      error: `Failed to stop native runtime: ${getErrorMessage(error)}`
     })
   }
 }
@@ -322,8 +456,8 @@ process.on('SIGTERM', () => {
 
 main().catch((error) => {
   log('sessionError', {
-    error: error instanceof Error ? error.message : String(error),
-    stack: error instanceof Error ? error.stack : undefined
+    error: getErrorMessage(error),
+    stack: getErrorStack(error)
   })
   process.exit(1)
 })
