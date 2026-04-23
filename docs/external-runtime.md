@@ -147,6 +147,114 @@ Interpretation:
 - If it logs `sessionError` saying no usable native constructor or no `start()` method exists, the installed `node-carplay/node` package is not currently a complete drop-in runtime and needs a wrapper, patch, or replacement native executor before Qt can control it as the active backend.
 - If it can start but media frames/audio are not exposed in a native-friendly way, session ownership may be viable while video/audio transport remains the next missing contract.
 
+## Native Runtime Service
+
+The probe has been promoted into a small native runtime service for the next Qt integration phase:
+
+```sh
+npm run native:runtime
+```
+
+Or start the service and immediately request a session:
+
+```sh
+npm run native:runtime:auto
+```
+
+Control it from another terminal:
+
+```sh
+npm run native:control -- getStatus
+npm run native:control -- startSession
+npm run native:control -- stopSession
+npm run native:control -- restartSession
+npm run native:control -- showCamera true
+npm run native:control -- setConfig '{"startMode":"manual"}'
+```
+
+The service listens on Socket.IO port `4100` by default. Override with `CARPLAY_NATIVE_PORT`.
+
+Supported request events:
+
+- `getConfig`
+- `setConfig`
+- `validateConfig`
+- `getStatus`
+- `startSession`
+- `stopSession`
+- `restartSession`
+- `showCamera`
+
+Published events:
+
+- `config`
+- `status`
+- `sessionEvent`
+- `runtimeMessage`
+
+Important environment variables:
+
+- `CARPLAY_NATIVE_CONFIG=/path/to/config.json`: Config file path. Defaults to `~/.config/react-carplay/config.json`.
+- `CARPLAY_NATIVE_PORT=4100`: Socket.IO control port.
+- `CARPLAY_NATIVE_AUTOSTART=1`: Start a session when the service boots.
+- `CARPLAY_NATIVE_START_RETRIES=2`: Retry startup after recoverable reset/re-enumeration failures.
+- `CARPLAY_NATIVE_REDISCOVERY_TIMEOUT_MS=30000`: Maximum time to wait for dongle re-enumeration.
+- `CARPLAY_NATIVE_STOP_RESET_TIMEOUT_MS=2500`: Reset timeout used during shutdown to settle pending USB transfers.
+- `CARPLAY_NATIVE_CLOSE_TIMEOUT_MS=1000`: Close timeout used during shutdown after reset.
+
+### Native Startup Patch
+
+The native service uses the same patched startup path proven by the probe:
+
+1. Find the dongle.
+2. Open it only for reset.
+3. Call `WebUSBDevice.reset()`.
+4. Treat `LIBUSB_ERROR_NOT_FOUND` / device disappearance during reset as expected on Raspberry Pi.
+5. Drop the stale handle.
+6. Wait for the dongle to re-enumerate.
+7. Reacquire and reopen the fresh WebUSB device.
+8. Call `carplay.dongleDriver.initialise(device)`.
+9. Call `carplay.dongleDriver.start(config)`.
+
+This keeps the patch local to this repo for now instead of editing `node_modules`.
+
+### Native Shutdown Patch
+
+Upstream `CarplayNode.stop()` calls through to `DongleDriver.close()`, which can throw on Raspberry Pi with:
+
+```text
+Can't close device with a pending request
+```
+
+That happens because `DongleDriver` has an active `transferIn` read loop. The native service does not treat that close path as authoritative. During `stopSession` it:
+
+1. Clears the CarPlay pair timer, frame interval, and dongle heartbeat interval.
+2. Detaches the driver from its active device/endpoints so no new writes are issued through stale state.
+3. Resets the active WebUSB device to settle or abort pending USB transfers.
+4. Attempts a bounded close.
+5. Treats a pending-request close failure as `usbCloseDeferred`, not as `sessionError`.
+6. Drops stale references and emits `sessionStopped`.
+
+This makes service-level stop deterministic even while the underlying WebUSB close implementation is imperfect. The dongle may re-enumerate after stop, which is expected.
+
+### Native Message Inventory
+
+The native path currently exposes these `node-carplay/node` messages through `runtimeMessage` and structured logs:
+
+- `command`: CarPlay command messages from the dongle/session.
+- `media`: Media metadata/state messages.
+- `audio`: PCM audio payload metadata; the service summarizes payloads and does not route audio yet.
+- `video`: H.264 video payload metadata; the service marks `receivingVideo` and summarizes payloads but does not transport/render video yet.
+- `plugged` / `unplugged`: Mapped to `phoneConnected` / `phoneDisconnected`.
+- `failure`: Mapped to `sessionError`.
+
+What still needs a Qt-facing contract:
+
+- Video transport from native runtime to Qt/native renderer.
+- Audio output routing from native runtime to ALSA/Pulse/PipeWire/MOST or Qt.
+- Microphone input policy and injection.
+- Touch and key command injection into `dongleDriver.send(...)`.
+
 ## Suggested Config For Qt-Oriented Runs
 
 Use the centralized config API to set:
