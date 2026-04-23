@@ -28,6 +28,9 @@ let socket: null | Socket = null
 const isPiRuntimeProfile = () =>
   process.env.REACT_CARPLAY_PROFILE === 'pi' || process.env.REACT_CARPLAY_PI === '1'
 
+const isPiSafeRuntimeProfile = () =>
+  process.env.REACT_CARPLAY_PROFILE === 'pi-safe' || process.env.REACT_CARPLAY_PI_SAFE === '1'
+
 const getPiVideoRenderer = (): VideoRenderer => {
   const renderer = process.env.REACT_CARPLAY_VIDEO_RENDERER
   switch (renderer) {
@@ -60,7 +63,21 @@ const configureChromiumRuntime = () => {
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
   app.commandLine.appendSwitch('disable-webusb-security', 'true')
 
-  if (isPiRuntimeProfile()) {
+  if (isPiSafeRuntimeProfile()) {
+    // Diagnostic fallback: disable Chromium's GPU process/rendering paths to confirm
+    // whether Raspberry Pi GPU-process instability is the choppiness/crash source.
+    app.disableHardwareAcceleration()
+    app.commandLine.appendSwitch('disable-gpu')
+    app.commandLine.appendSwitch('disable-gpu-compositing')
+    app.commandLine.appendSwitch('disable-gpu-rasterization')
+    app.commandLine.appendSwitch('disable-accelerated-2d-canvas')
+    app.commandLine.appendSwitch('disable-accelerated-video-decode')
+    app.commandLine.appendSwitch('disable-zero-copy')
+    app.commandLine.appendSwitch('disable-features', 'Vulkan,WebGPU,VaapiVideoDecoder,CanvasOopRasterization,UseSkiaRenderer')
+    app.commandLine.appendSwitch('use-gl', 'disabled')
+    app.commandLine.appendSwitch('use-angle', 'none')
+    console.log('React-CarPlay Pi SAFE runtime profile enabled: Chromium GPU acceleration disabled for diagnostic fallback')
+  } else if (isPiRuntimeProfile()) {
     const glProfile = getPiGlProfile()
     app.commandLine.appendSwitch('disable-features', 'Vulkan,WebGPU')
     app.commandLine.appendSwitch('ignore-gpu-blocklist')
@@ -220,7 +237,12 @@ const initializeServices = () => {
   const defaults = createDefaultConfig(DEFAULT_CONFIG)
   configStore = new ConfigStore(configPath, defaults)
   configStore.load()
-  if (isPiRuntimeProfile()) {
+  if (isPiSafeRuntimeProfile()) {
+    configStore.setConfig({
+      videoRenderer: 'webgl',
+      videoDecoderAcceleration: 'prefer-software'
+    })
+  } else if (isPiRuntimeProfile()) {
     configStore.setConfig({
       videoRenderer: getPiVideoRenderer(),
       videoDecoderAcceleration: getPiVideoDecoderAcceleration()
