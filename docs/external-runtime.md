@@ -235,7 +235,7 @@ curl -X POST http://127.0.0.1:4100/camera \
   -d '{"visible":true}'
 curl -X POST http://127.0.0.1:4100/config \
   -H 'Content-Type: application/json' \
-  -d '{"startMode":"manual","runtimeEngine":"external"}'
+  -d '{"startMode":"manual","runtimeEngine":"external","width":800,"height":640,"fps":60}'
 ```
 
 Successful responses return the current resource directly. For example, `GET /status` and `POST /start` return a status object:
@@ -249,6 +249,16 @@ Successful responses return the current resource directly. For example, `GET /st
   "receivingVideo": false,
   "cameraVisible": false,
   "lastError": null,
+  "activeVideoConfig": {
+    "width": 800,
+    "height": 640,
+    "fps": 60
+  },
+  "pendingVideoConfig": {
+    "width": 800,
+    "height": 640,
+    "fps": 60
+  },
   "metadata": {
     "runtimeEngine": "native-node",
     "configPath": "/home/pi/.config/react-carplay/config.json",
@@ -364,7 +374,7 @@ The native service uses the same patched startup path proven by the probe:
 6. Wait for the dongle to re-enumerate.
 7. Reacquire and reopen the fresh WebUSB device.
 8. Call `carplay.dongleDriver.initialise(device)`.
-9. Call `carplay.dongleDriver.start(config)`.
+9. Call `carplay.dongleDriver.start(config)`, including persisted `width`, `height`, and `fps` in the CarPlay open/session handshake.
 
 This keeps the patch local to this repo for now instead of editing `node_modules`.
 

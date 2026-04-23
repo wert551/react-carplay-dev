@@ -108,27 +108,37 @@ After video frames are observed, a response should look more like:
 
 `binaryStreamAvailable` reports whether the TCP stream server is listening. It can be `true` before frames are available; use `available`, `totalFrames`, and `streamingActive` to determine whether CarPlay video is currently flowing.
 
-### Runtime Resolution Config
+### Runtime Video Config
 
-Qt should set the desired CarPlay session resolution through `POST /config` before starting or restarting the session:
+Qt should set the desired CarPlay session video config through `POST /config` before starting or restarting the session:
 
 ```sh
 curl -X POST http://127.0.0.1:4100/config \
   -H 'Content-Type: application/json' \
-  -d '{"width":800,"height":640}'
+  -d '{"width":800,"height":640,"fps":60}'
 ```
 
-The service validates `width` and `height` as positive integers, persists them in the active config file, and passes the merged config into `new CarplayNode(config)`. Startup then uses `carplay._config` for `dongleDriver.start(runtimeConfig)`, so the configured `width` and `height` are the values sent to the dongle for the new session.
+The service validates `width`, `height`, and `fps` as positive integers, persists them in the active config file, and passes the merged config into `new CarplayNode(config)`. Startup then uses `carplay._config` for `dongleDriver.start(runtimeConfig)`, so the configured `width`, `height`, and `fps` are the values sent to the dongle for the new session open handshake.
 
-Resolution changes do not mutate an already-running CarPlay session in place. If `width` or `height` changes while the session is starting, waiting for phone, connected, or stopping, `/status` reports:
+Video-config changes do not mutate an already-running CarPlay session in place. If `width`, `height`, or `fps` changes while the session is starting, waiting for phone, connected, or stopping, `/status` reports:
 
 ```json
 {
   "restartRequired": true,
-  "restartReason": "resolutionChanged",
+  "restartReason": "fpsChanged",
+  "pendingVideoConfig": {
+    "width": 800,
+    "height": 640,
+    "fps": 60
+  },
+  "activeVideoConfig": {
+    "width": 800,
+    "height": 640,
+    "fps": 20
+  },
   "pendingResolution": {
-    "width": 1024,
-    "height": 600
+    "width": 800,
+    "height": 640
   },
   "activeResolution": {
     "width": 800,
@@ -137,7 +147,7 @@ Resolution changes do not mutate an already-running CarPlay session in place. If
 }
 ```
 
-Use `POST /restart` to apply the pending resolution. After startup applies the config, `/status` reports the matching `activeResolution` and clears `restartRequired`.
+Use `POST /restart` to apply the pending video config. After startup applies the config, `/status` reports the matching `activeVideoConfig`, updates `activeResolution`, and clears `restartRequired`.
 
 ### Binary H.264 Stream
 
@@ -336,16 +346,16 @@ Set desired runtime resolution before start:
 ```sh
 curl -X POST http://127.0.0.1:4100/config \
   -H 'Content-Type: application/json' \
-  -d '{"width":800,"height":640}'
+  -d '{"width":800,"height":640,"fps":60}'
 curl -X POST http://127.0.0.1:4100/start
 ```
 
-Change resolution while running, then apply with restart:
+Change fps while running, verify the pending/applied split, then apply with restart:
 
 ```sh
 curl -X POST http://127.0.0.1:4100/config \
   -H 'Content-Type: application/json' \
-  -d '{"width":1024,"height":600}'
+  -d '{"fps":20}'
 curl http://127.0.0.1:4100/status
 curl -X POST http://127.0.0.1:4100/restart
 curl http://127.0.0.1:4100/status

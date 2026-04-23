@@ -72,6 +72,8 @@ const status = {
   restartReason: null,
   configRevision: 0,
   appliedConfigRevision: 0,
+  activeVideoConfig: null,
+  pendingVideoConfig: null,
   activeResolution: null,
   pendingResolution: null,
   updatedAt: Date.now(),
@@ -187,12 +189,18 @@ const emitRuntimeMessage = (message) => {
 const toResolutionValue = (value) => {
   if (value == null) return null
   const number = Number(value)
-  return Number.isFinite(number) ? number : null
+  return Number.isInteger(number) && number > 0 ? number : null
 }
 
-const getConfiguredResolution = (candidate = config) => ({
+const getConfiguredVideoConfig = (candidate = config) => ({
   width: toResolutionValue(candidate?.width),
-  height: toResolutionValue(candidate?.height)
+  height: toResolutionValue(candidate?.height),
+  fps: toResolutionValue(candidate?.fps)
+})
+
+const getConfiguredResolution = (candidate = config) => ({
+  width: getConfiguredVideoConfig(candidate).width,
+  height: getConfiguredVideoConfig(candidate).height
 })
 
 const isSessionActive = () =>
@@ -807,6 +815,7 @@ const loadConfig = () => {
     ...defaults,
     ...diskConfig
   }
+  status.pendingVideoConfig = getConfiguredVideoConfig(config)
   status.pendingResolution = getConfiguredResolution(config)
   persistConfig()
   return config
@@ -839,6 +848,10 @@ const validateConfig = (candidate) => {
     const error = validateDimension('height', candidate.height)
     if (error) errors.push(error)
   }
+  if (hasOwn(candidate, 'fps')) {
+    const error = validateDimension('fps', candidate.fps)
+    if (error) errors.push(error)
+  }
 
   return { valid: errors.length === 0, errors }
 }
@@ -851,6 +864,9 @@ const normalizeConfigUpdate = (candidate) => {
   if (hasOwn(update, 'height')) {
     update.height = Number(update.height)
   }
+  if (hasOwn(update, 'fps')) {
+    update.fps = Number(update.fps)
+  }
   return update
 }
 
@@ -860,32 +876,39 @@ const setConfig = (update) => {
     throw new Error(validation.errors.join(', '))
   }
   const normalizedUpdate = normalizeConfigUpdate(update)
+  const previousVideoConfig = getConfiguredVideoConfig(config)
   const previousResolution = getConfiguredResolution(config)
   config = {
     ...config,
     ...normalizedUpdate
   }
+  const nextVideoConfig = getConfiguredVideoConfig(config)
   const nextResolution = getConfiguredResolution(config)
   const resolutionChanged =
     (hasOwn(normalizedUpdate, 'width') || hasOwn(normalizedUpdate, 'height')) &&
     (previousResolution.width !== nextResolution.width || previousResolution.height !== nextResolution.height)
+  const fpsChanged = hasOwn(normalizedUpdate, 'fps') && previousVideoConfig.fps !== nextVideoConfig.fps
 
   status.configRevision += 1
+  status.pendingVideoConfig = nextVideoConfig
   status.pendingResolution = nextResolution
 
-  if (resolutionChanged && isSessionActive()) {
+  if ((resolutionChanged || fpsChanged) && isSessionActive()) {
     status.restartRequired = true
-    status.restartReason = 'resolutionChanged'
+    status.restartReason = resolutionChanged && fpsChanged ? 'videoConfigChanged' : resolutionChanged ? 'resolutionChanged' : 'fpsChanged'
     log('configUpdated', {
-      width: nextResolution.width,
-      height: nextResolution.height,
+      width: nextVideoConfig.width,
+      height: nextVideoConfig.height,
+      fps: nextVideoConfig.fps,
       restartRequired: true,
-      diagnostic: 'Resolution changes are applied on the next start/restart, not to the already-running session.'
+      diagnostic:
+        'Width, height, and fps changes are applied on the next start/restart, not to the already-running session.'
     })
   } else {
     log('configUpdated', {
-      width: nextResolution.width,
-      height: nextResolution.height,
+      width: nextVideoConfig.width,
+      height: nextVideoConfig.height,
+      fps: nextVideoConfig.fps,
       restartRequired: false
     })
   }
@@ -1138,6 +1161,8 @@ const startPatchedRuntime = async () => {
   await carplay.dongleDriver.start(runtimeConfig)
   setStatus({
     appliedConfigRevision: status.configRevision,
+    activeVideoConfig: getConfiguredVideoConfig(runtimeConfig),
+    pendingVideoConfig: getConfiguredVideoConfig(config),
     activeResolution: getConfiguredResolution(runtimeConfig),
     pendingResolution: getConfiguredResolution(config),
     restartRequired: false,
@@ -1145,7 +1170,7 @@ const startPatchedRuntime = async () => {
   })
   log('runtimeConfigApplied', {
     configRevision: status.configRevision,
-    ...getConfiguredResolution(runtimeConfig)
+    ...getConfiguredVideoConfig(runtimeConfig)
   })
   scheduleWifiPair(runtimeConfig)
 }
@@ -1165,6 +1190,7 @@ const startSession = async () => {
       startedAt: Date.now(),
       stoppedAt: null,
       receivingVideo: false,
+      pendingVideoConfig: getConfiguredVideoConfig(config),
       pendingResolution: getConfiguredResolution(config)
     })
     resetVideoDiagnostics()
@@ -1283,6 +1309,8 @@ const stopSession = async () => {
       deviceFound: Boolean(findDongle()),
       receivingVideo: false,
       stoppedAt: Date.now(),
+      activeVideoConfig: null,
+      pendingVideoConfig: getConfiguredVideoConfig(config),
       activeResolution: null
     })
     resetVideoDiagnostics()
