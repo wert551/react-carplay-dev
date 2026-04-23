@@ -191,6 +191,7 @@ Published events:
 - `status`
 - `sessionEvent`
 - `runtimeMessage`
+- `oemExitRequested`
 
 Important environment variables:
 
@@ -301,6 +302,7 @@ Event `type` values:
 - `config`: Full config object.
 - `sessionEvent`: Structured lifecycle/log event.
 - `runtimeMessage`: Summarized native `command`, `media`, `audio`, or `video` message.
+- `oemExitRequested`: Real CarPlay OEM/My Car button request, sourced from `node-carplay` `CommandMapping.requestHostUI`.
 
 Example `sessionEvent`:
 
@@ -330,6 +332,25 @@ Example `runtimeMessage`:
   }
 }
 ```
+
+Example OEM/My Car exit event:
+
+```json
+{
+  "type": "oemExitRequested",
+  "timestamp": "2026-04-23T12:00:00.000Z",
+  "data": {
+    "timestamp": "2026-04-23T12:00:00.000Z",
+    "event": "oemExitRequested",
+    "source": "node-carplay CommandMapping.requestHostUI",
+    "commandValue": 3,
+    "commandName": "requestHostUI",
+    "diagnostic": "CarPlay OEM/My Car button requested host UI"
+  }
+}
+```
+
+The original React renderer handled this same runtime signal by routing `CommandMapping.requestHostUI` to `/settings`. For Qt, handle `oemExitRequested` by returning to the last non-CarPlay page.
 
 ### Native Startup Patch
 

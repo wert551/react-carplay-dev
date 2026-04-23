@@ -25,6 +25,7 @@
     "native:runtime:auto": "CARPLAY_NATIVE_AUTOSTART=1 node scripts/native-runtime-service.cjs",
     "native:control": "node scripts/native-runtime-client.cjs",
     "native:io": "node scripts/native-runtime-http-client.cjs",
+    "native:events": "node scripts/native-runtime-events-client.cjs",
     "native:video:test": "node scripts/native-video-stream-client.cjs",
     "postinstall": "electron-builder install-app-deps",
     "build:win": "npm run build && electron-builder --win --config",

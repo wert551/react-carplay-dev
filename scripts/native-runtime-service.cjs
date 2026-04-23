@@ -165,6 +165,7 @@ const log = (event, details = {}) => {
   console.log(JSON.stringify(payload))
   io.emit('sessionEvent', payload)
   emitWebSocketEvent('sessionEvent', payload)
+  return payload
 }
 
 const emitStatus = () => {
@@ -198,6 +199,33 @@ const isSessionActive = () =>
   ['starting', 'waiting_for_dongle', 'waiting_for_phone', 'connected', 'stopping'].includes(status.session)
 
 const hasOwn = (candidate, key) => Object.prototype.hasOwnProperty.call(candidate, key)
+
+const getRequestHostUiCommandValue = () => {
+  const mapping = nativeModule?.CommandMapping ?? nativeModule?.default?.CommandMapping
+  return Number(mapping?.requestHostUI ?? 3)
+}
+
+const getCommandName = (value) => {
+  const mapping = nativeModule?.CommandMapping ?? nativeModule?.default?.CommandMapping
+  return mapping?.[value] ?? null
+}
+
+const isRequestHostUiCommand = (message) => {
+  const value = Number(message?.value)
+  return Number.isFinite(value) && value === getRequestHostUiCommandValue()
+}
+
+const emitOemExitRequested = (commandMessage) => {
+  const commandValue = Number(commandMessage?.value)
+  const payload = log('oemExitRequested', {
+    source: 'node-carplay CommandMapping.requestHostUI',
+    commandValue,
+    commandName: getCommandName(commandValue) ?? 'requestHostUI',
+    diagnostic: 'CarPlay OEM/My Car button requested host UI'
+  })
+  io.emit('oemExitRequested', payload)
+  emitWebSocketEvent('oemExitRequested', payload)
+}
 
 const getVideoStreamStatus = () => ({
   binaryStreamAvailable: Boolean(videoStreamServer?.listening),
@@ -1063,7 +1091,16 @@ const attachMessageHandler = () => {
         break
       case 'audio':
       case 'media':
+        emitRuntimeMessage({ type, message: summarize(message?.message) })
+        log('runtimeMessage', {
+          type,
+          message: summarize(message?.message)
+        })
+        break
       case 'command':
+        if (isRequestHostUiCommand(message?.message)) {
+          emitOemExitRequested(message.message)
+        }
         emitRuntimeMessage({ type, message: summarize(message?.message) })
         log('runtimeMessage', {
           type,

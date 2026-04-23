@@ -269,6 +269,46 @@ Failure response example:
 }
 ```
 
+### OEM / My Car Exit Event
+
+The OEM car button inside the CarPlay UI is not detected from pixels or touch coordinates. It is a real CarPlay runtime command.
+
+Original React-CarPlay behavior:
+
+- `src/renderer/src/components/worker/CarPlay.worker.ts` forwarded native `command` messages from `node-carplay/web` back to the React session adapter.
+- `src/renderer/src/session/useCarplaySessionAdapter.ts` handled `CommandMapping.requestHostUI` by navigating to `/settings`, returning the user to the host/debug UI.
+- In `node-carplay`, `CommandMapping.requestHostUI` is command value `3` and is documented as the CarPlay interface "My Car" button click.
+
+Native service behavior:
+
+- `scripts/native-runtime-service.cjs` watches native `command` messages from `node-carplay/node`.
+- When the command value is `CommandMapping.requestHostUI` (`3` fallback if the enum is not exported at runtime), it emits `oemExitRequested`.
+- The original `runtimeMessage` is still emitted, so diagnostics and existing consumers are not broken.
+
+Plain WebSocket event at `ws://127.0.0.1:4100/events`:
+
+```json
+{
+  "type": "oemExitRequested",
+  "timestamp": "2026-04-23T12:00:00.000Z",
+  "data": {
+    "timestamp": "2026-04-23T12:00:00.000Z",
+    "event": "oemExitRequested",
+    "source": "node-carplay CommandMapping.requestHostUI",
+    "commandValue": 3,
+    "commandName": "requestHostUI",
+    "diagnostic": "CarPlay OEM/My Car button requested host UI"
+  }
+}
+```
+
+The same payload is also emitted as:
+
+- Socket.IO event `oemExitRequested`.
+- Socket.IO/WebSocket `sessionEvent` with `data.event === "oemExitRequested"`.
+
+Qt should treat this as the request to leave the CarPlay page and restore the last non-CarPlay page.
+
 ## Pi Shell Test Commands
 
 Start the native runtime service:
@@ -353,6 +393,14 @@ npm run native:io -- touch down 0.5 0.5
 npm run native:io -- touch up 0.5 0.5
 npm run native:io -- key home
 ```
+
+Watch for the OEM/My Car exit event:
+
+```sh
+npm run native:events -- oemExitRequested
+```
+
+With the service running and the session connected, press the OEM/My Car button inside CarPlay. The listener should print a JSON event whose top-level `type` is `oemExitRequested`. The service terminal should also log a JSON line with `"event":"oemExitRequested"`.
 
 ## Input Hooks That Already Exist
 
