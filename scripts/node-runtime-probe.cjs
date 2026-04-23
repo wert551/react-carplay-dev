@@ -10,6 +10,9 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.CARPLAY_PROBE_TIMEOUT_MS ?? 0)
 const START_RETRY_LIMIT = Number(process.env.CARPLAY_PROBE_START_RETRIES ?? 2)
 const DONGLE_REDISCOVERY_TIMEOUT_MS = Number(process.env.CARPLAY_PROBE_REDISCOVERY_TIMEOUT_MS ?? 15000)
 const DONGLE_POLL_INTERVAL_MS = Number(process.env.CARPLAY_PROBE_POLL_INTERVAL_MS ?? 1000)
+const NATIVE_START_MODE = process.env.CARPLAY_PROBE_NATIVE_START_MODE ?? 'patched'
+const USB_RESET_SETTLE_MS = Number(process.env.CARPLAY_PROBE_RESET_SETTLE_MS ?? 500)
+const WIFI_PAIR_DELAY_MS = Number(process.env.CARPLAY_PROBE_WIFI_PAIR_DELAY_MS ?? 15000)
 
 let nativeModule = null
 let usbModule = null
@@ -32,6 +35,18 @@ const formatDevice = (dongle) => {
     productId: `0x${dongle.deviceDescriptor.idProduct.toString(16)}`,
     busNumber: dongle.busNumber,
     deviceAddress: dongle.deviceAddress
+  }
+}
+
+const formatWebUsbDevice = (device) => {
+  if (!device) return {}
+  return {
+    vendorId: typeof device.vendorId === 'number' ? `0x${device.vendorId.toString(16)}` : undefined,
+    productId: typeof device.productId === 'number' ? `0x${device.productId.toString(16)}` : undefined,
+    productName: device.productName,
+    manufacturerName: device.manufacturerName,
+    serialNumber: device.serialNumber,
+    opened: device.opened
   }
 }
 
@@ -213,6 +228,98 @@ const waitForDongle = async ({ rediscovery = false, timeoutMs = 0 } = {}) => {
   return null
 }
 
+const requestWebUsbDongle = async ({ timeoutMs = 0 } = {}) => {
+  if (!usbModule?.webusb?.requestDevice) {
+    throw new Error('usb.webusb.requestDevice is unavailable; cannot run patched native startup path')
+  }
+
+  const filters = nativeModule.DongleDriver?.knownDevices ?? [
+    { vendorId: DONGLE_VENDOR_ID, productId: 0x1520 },
+    { vendorId: DONGLE_VENDOR_ID, productId: 0x1521 }
+  ]
+  const startedAt = Date.now()
+
+  while (!stopping) {
+    try {
+      const device = await usbModule.webusb.requestDevice({ filters })
+      if (device) return device
+    } catch {
+      // requestDevice throws while the dongle is absent during reset/re-enumeration.
+    }
+
+    if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
+      return null
+    }
+    await delay(DONGLE_POLL_INTERVAL_MS)
+  }
+
+  return null
+}
+
+const closeWebUsbDevice = async (device, reason) => {
+  if (!device?.opened || typeof device.close !== 'function') return
+  try {
+    await device.close()
+  } catch (error) {
+    log('probeWarning', {
+      warning: `Ignoring WebUSB close() failure after ${reason}: ${getErrorMessage(error)}`
+    })
+  }
+}
+
+const resetAndReopenDongle = async () => {
+  const resetDevice = await requestWebUsbDongle()
+  if (!resetDevice) {
+    throw new Error('Unable to acquire dongle before reset')
+  }
+
+  log('resetStarted', {
+    mode: 'patched',
+    ...formatWebUsbDevice(resetDevice)
+  })
+
+  await resetDevice.open()
+  try {
+    await resetDevice.reset()
+  } catch (error) {
+    if (!isResetLostDeviceError(error)) throw error
+    log('resetLostDevice', {
+      error: getErrorMessage(error),
+      diagnostic:
+        'WebUSBDevice.reset() caused the dongle to disappear, which is expected on Raspberry Pi. The stale handle will be discarded.'
+    })
+  } finally {
+    await closeWebUsbDevice(resetDevice, 'reset')
+  }
+
+  if (USB_RESET_SETTLE_MS > 0) {
+    await delay(USB_RESET_SETTLE_MS)
+  }
+
+  const rediscoveredNativeDevice = await waitForDongle({
+    rediscovery: true,
+    timeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS
+  })
+
+  if (!rediscoveredNativeDevice) {
+    throw new Error(`Dongle did not re-enumerate after reset within ${DONGLE_REDISCOVERY_TIMEOUT_MS}ms`)
+  }
+
+  const rediscoveredDevice = await requestWebUsbDongle({
+    timeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS
+  })
+
+  if (!rediscoveredDevice) {
+    throw new Error(`Dongle did not become available through usb.webusb after ${DONGLE_REDISCOVERY_TIMEOUT_MS}ms`)
+  }
+
+  await rediscoveredDevice.open()
+  log('deviceReopened', {
+    ...formatWebUsbDevice(rediscoveredDevice)
+  })
+  return rediscoveredDevice
+}
+
 const safeStopCarplay = async (reason) => {
   if (!carplay || typeof carplay.stop !== 'function') return
   try {
@@ -224,7 +331,7 @@ const safeStopCarplay = async (reason) => {
   }
 }
 
-const startCarplay = async (dongle) => {
+const startUpstreamCarplay = async (dongle) => {
   if (carplay.start.length > 0 && dongle) {
     log('nativeStartInvoked', {
       mode: 'start(device)',
@@ -238,6 +345,61 @@ const startCarplay = async (dongle) => {
     expectedArgs: carplay.start.length
   })
   return carplay.start()
+}
+
+const scheduleWifiPair = (config) => {
+  const SendCommand = nativeModule.SendCommand
+  if (typeof SendCommand !== 'function') {
+    log('probeWarning', {
+      warning: 'node-carplay/node does not export SendCommand; skipping wifiPair timeout'
+    })
+    return
+  }
+
+  carplay._pairTimeout = setTimeout(() => {
+    log('nativeMessage', {
+      type: 'wifiPairTimeout',
+      message: { delayMs: WIFI_PAIR_DELAY_MS }
+    })
+    carplay.dongleDriver.send(new SendCommand('wifiPair'))
+  }, WIFI_PAIR_DELAY_MS)
+
+  log('nativeMessage', {
+    type: 'wifiPairScheduled',
+    message: {
+      delayMs: WIFI_PAIR_DELAY_MS,
+      width: config.width,
+      height: config.height,
+      fps: config.fps
+    }
+  })
+}
+
+const startPatchedCarplay = async (config) => {
+  if (!carplay?.dongleDriver) {
+    throw new Error('Patched native startup requires a CarplayNode instance with dongleDriver')
+  }
+  if (typeof carplay.dongleDriver.initialise !== 'function' || typeof carplay.dongleDriver.start !== 'function') {
+    throw new Error('Patched native startup requires dongleDriver.initialise() and dongleDriver.start()')
+  }
+
+  log('nativeStartInvoked', {
+    mode: 'patched-reset-reopen',
+    note: 'Bypassing CarplayNode.start() so reset re-enumeration can reopen a fresh WebUSB device handle'
+  })
+
+  // Probe-only replacement for node-carplay/node CarplayNode.start():
+  // reset first, discard the stale WebUSBDevice, rediscover, reopen, then use DongleDriver directly.
+  const device = await resetAndReopenDongle()
+  const runtimeConfig = carplay._config ?? config
+  try {
+    await carplay.dongleDriver.initialise(device)
+    await carplay.dongleDriver.start(runtimeConfig)
+    scheduleWifiPair(runtimeConfig)
+  } catch (error) {
+    await closeWebUsbDevice(device, 'patched startup failure')
+    throw error
+  }
 }
 
 const createRuntime = (NativeCarplay, config) => {
@@ -268,11 +430,16 @@ const startWithResetRecovery = async (NativeCarplay, config, initialDongle) => {
     if (!createRuntime(NativeCarplay, config)) return false
 
     try {
-      log('resetStarted', {
-        attempt,
-        note: 'node-carplay/node performs dongle reset during start; LIBUSB_ERROR_NOT_FOUND usually means the device disappeared and may re-enumerate'
-      })
-      await startCarplay(dongle)
+      if (NATIVE_START_MODE === 'upstream') {
+        log('resetStarted', {
+          attempt,
+          mode: 'upstream',
+          note: 'node-carplay/node performs dongle reset during start; LIBUSB_ERROR_NOT_FOUND usually means the device disappeared and may re-enumerate'
+        })
+        await startUpstreamCarplay(dongle)
+      } else {
+        await startPatchedCarplay(config)
+      }
       log('nativeStartReturned')
       return true
     } catch (error) {
@@ -365,9 +532,9 @@ const attachMessageHandler = () => {
     ;['message', 'plugged', 'unplugged', 'failure', 'error', 'video', 'audio'].forEach((eventName) => {
       carplay.on(eventName, (payload) => {
         if (eventName === 'error') {
-      log('sessionError', {
-        error: getErrorMessage(payload)
-      })
+          log('sessionError', {
+            error: getErrorMessage(payload)
+          })
           return
         }
         mapMessageToEvent({ type: eventName, message: payload })
@@ -391,6 +558,7 @@ const startNativeRuntime = async () => {
   log('nativeRuntimeCandidate', {
     constructorName: NativeCarplay.name || '(anonymous)',
     configKeys: Object.keys(config).sort(),
+    nativeStartMode: NATIVE_START_MODE,
     startRetryLimit: START_RETRY_LIMIT,
     rediscoveryTimeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS
   })
