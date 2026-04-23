@@ -108,6 +108,37 @@ After video frames are observed, a response should look more like:
 
 `binaryStreamAvailable` reports whether the TCP stream server is listening. It can be `true` before frames are available; use `available`, `totalFrames`, and `streamingActive` to determine whether CarPlay video is currently flowing.
 
+### Runtime Resolution Config
+
+Qt should set the desired CarPlay session resolution through `POST /config` before starting or restarting the session:
+
+```sh
+curl -X POST http://127.0.0.1:4100/config \
+  -H 'Content-Type: application/json' \
+  -d '{"width":800,"height":640}'
+```
+
+The service validates `width` and `height` as positive integers, persists them in the active config file, and passes the merged config into `new CarplayNode(config)`. Startup then uses `carplay._config` for `dongleDriver.start(runtimeConfig)`, so the configured `width` and `height` are the values sent to the dongle for the new session.
+
+Resolution changes do not mutate an already-running CarPlay session in place. If `width` or `height` changes while the session is starting, waiting for phone, connected, or stopping, `/status` reports:
+
+```json
+{
+  "restartRequired": true,
+  "restartReason": "resolutionChanged",
+  "pendingResolution": {
+    "width": 1024,
+    "height": 600
+  },
+  "activeResolution": {
+    "width": 800,
+    "height": 640
+  }
+}
+```
+
+Use `POST /restart` to apply the pending resolution. After startup applies the config, `/status` reports the matching `activeResolution` and clears `restartRequired`.
+
 ### Binary H.264 Stream
 
 Use a separate local-only TCP socket. Defaults:
@@ -258,6 +289,26 @@ Query video diagnostics:
 
 ```sh
 curl http://127.0.0.1:4100/video/status
+```
+
+Set desired runtime resolution before start:
+
+```sh
+curl -X POST http://127.0.0.1:4100/config \
+  -H 'Content-Type: application/json' \
+  -d '{"width":800,"height":640}'
+curl -X POST http://127.0.0.1:4100/start
+```
+
+Change resolution while running, then apply with restart:
+
+```sh
+curl -X POST http://127.0.0.1:4100/config \
+  -H 'Content-Type: application/json' \
+  -d '{"width":1024,"height":600}'
+curl http://127.0.0.1:4100/status
+curl -X POST http://127.0.0.1:4100/restart
+curl http://127.0.0.1:4100/status
 ```
 
 Count 120 binary stream packets:

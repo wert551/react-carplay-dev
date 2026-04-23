@@ -68,6 +68,12 @@ const status = {
   lastError: null,
   startedAt: null,
   stoppedAt: null,
+  restartRequired: false,
+  restartReason: null,
+  configRevision: 0,
+  appliedConfigRevision: 0,
+  activeResolution: null,
+  pendingResolution: null,
   updatedAt: Date.now(),
   metadata: {
     runtimeEngine: 'native-node',
@@ -176,6 +182,22 @@ const emitRuntimeMessage = (message) => {
   io.emit('runtimeMessage', message)
   emitWebSocketEvent('runtimeMessage', message)
 }
+
+const toResolutionValue = (value) => {
+  if (value == null) return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+const getConfiguredResolution = (candidate = config) => ({
+  width: toResolutionValue(candidate?.width),
+  height: toResolutionValue(candidate?.height)
+})
+
+const isSessionActive = () =>
+  ['starting', 'waiting_for_dongle', 'waiting_for_phone', 'connected', 'stopping'].includes(status.session)
+
+const hasOwn = (candidate, key) => Object.prototype.hasOwnProperty.call(candidate, key)
 
 const getVideoStreamStatus = () => ({
   binaryStreamAvailable: Boolean(videoStreamServer?.listening),
@@ -757,6 +779,7 @@ const loadConfig = () => {
     ...defaults,
     ...diskConfig
   }
+  status.pendingResolution = getConfiguredResolution(config)
   persistConfig()
   return config
 }
@@ -766,11 +789,41 @@ const persistConfig = () => {
   fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`)
 }
 
+const validateDimension = (name, value) => {
+  const number = Number(value)
+  if (!Number.isInteger(number) || number <= 0) {
+    return `${name} must be a positive integer`
+  }
+  return null
+}
+
 const validateConfig = (candidate) => {
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
     return { valid: false, errors: ['config must be an object'] }
   }
-  return { valid: true, errors: [] }
+
+  const errors = []
+  if (hasOwn(candidate, 'width')) {
+    const error = validateDimension('width', candidate.width)
+    if (error) errors.push(error)
+  }
+  if (hasOwn(candidate, 'height')) {
+    const error = validateDimension('height', candidate.height)
+    if (error) errors.push(error)
+  }
+
+  return { valid: errors.length === 0, errors }
+}
+
+const normalizeConfigUpdate = (candidate) => {
+  const update = { ...candidate }
+  if (hasOwn(update, 'width')) {
+    update.width = Number(update.width)
+  }
+  if (hasOwn(update, 'height')) {
+    update.height = Number(update.height)
+  }
+  return update
 }
 
 const setConfig = (update) => {
@@ -778,12 +831,40 @@ const setConfig = (update) => {
   if (!validation.valid) {
     throw new Error(validation.errors.join(', '))
   }
+  const normalizedUpdate = normalizeConfigUpdate(update)
+  const previousResolution = getConfiguredResolution(config)
   config = {
     ...config,
-    ...update
+    ...normalizedUpdate
   }
+  const nextResolution = getConfiguredResolution(config)
+  const resolutionChanged =
+    (hasOwn(normalizedUpdate, 'width') || hasOwn(normalizedUpdate, 'height')) &&
+    (previousResolution.width !== nextResolution.width || previousResolution.height !== nextResolution.height)
+
+  status.configRevision += 1
+  status.pendingResolution = nextResolution
+
+  if (resolutionChanged && isSessionActive()) {
+    status.restartRequired = true
+    status.restartReason = 'resolutionChanged'
+    log('configUpdated', {
+      width: nextResolution.width,
+      height: nextResolution.height,
+      restartRequired: true,
+      diagnostic: 'Resolution changes are applied on the next start/restart, not to the already-running session.'
+    })
+  } else {
+    log('configUpdated', {
+      width: nextResolution.width,
+      height: nextResolution.height,
+      restartRequired: false
+    })
+  }
+
   persistConfig()
   emitConfig()
+  emitStatus()
   return config
 }
 
@@ -1018,6 +1099,17 @@ const startPatchedRuntime = async () => {
   const runtimeConfig = carplay._config ?? config
   await carplay.dongleDriver.initialise(device)
   await carplay.dongleDriver.start(runtimeConfig)
+  setStatus({
+    appliedConfigRevision: status.configRevision,
+    activeResolution: getConfiguredResolution(runtimeConfig),
+    pendingResolution: getConfiguredResolution(config),
+    restartRequired: false,
+    restartReason: null
+  })
+  log('runtimeConfigApplied', {
+    configRevision: status.configRevision,
+    ...getConfiguredResolution(runtimeConfig)
+  })
   scheduleWifiPair(runtimeConfig)
 }
 
@@ -1035,7 +1127,8 @@ const startSession = async () => {
       lastError: null,
       startedAt: Date.now(),
       stoppedAt: null,
-      receivingVideo: false
+      receivingVideo: false,
+      pendingResolution: getConfiguredResolution(config)
     })
     resetVideoDiagnostics()
 
@@ -1152,7 +1245,8 @@ const stopSession = async () => {
       isPlugged: false,
       deviceFound: Boolean(findDongle()),
       receivingVideo: false,
-      stoppedAt: Date.now()
+      stoppedAt: Date.now(),
+      activeResolution: null
     })
     resetVideoDiagnostics()
     return status
