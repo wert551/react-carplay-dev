@@ -2,6 +2,7 @@
 
 const { io } = require('socket.io-client')
 
+const HOST = process.env.CARPLAY_NATIVE_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.CARPLAY_NATIVE_PORT ?? 4100)
 const command = process.argv[2] ?? 'getStatus'
 const rawArg = process.argv[3]
@@ -17,7 +18,7 @@ const parseArg = () => {
   }
 }
 
-const socket = io(`http://localhost:${PORT}`, {
+const socket = io(`http://${HOST}:${PORT}`, {
   reconnection: false,
   timeout: 5000
 })
@@ -64,7 +65,7 @@ socket.on('connect_error', (error) => {
   finish(
     {
       ok: false,
-      error: `Unable to connect to native runtime service on port ${PORT}: ${error.message}`
+      error: `Unable to connect to native runtime service at http://${HOST}:${PORT}: ${error.message}`
     },
     1
   )

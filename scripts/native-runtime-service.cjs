@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 
 const fs = require('node:fs')
+const crypto = require('node:crypto')
+const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const { Server } = require('socket.io')
 
 const DONGLE_VENDOR_ID = 0x1314
 const DONGLE_PRODUCT_IDS = new Set([0x1520, 0x1521])
+const HOST = process.env.CARPLAY_NATIVE_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.CARPLAY_NATIVE_PORT ?? 4100)
 const CONFIG_PATH =
   process.env.CARPLAY_NATIVE_CONFIG ?? path.join(os.homedir(), '.config', 'react-carplay', 'config.json')
@@ -27,6 +30,7 @@ let activeWebUsbDevice = null
 let config = null
 let startPromise = null
 let stopPromise = null
+let httpServer = null
 let stopping = false
 
 const status = {
@@ -64,16 +68,68 @@ const io = new Server({
     origin: '*'
   }
 })
+const wsClients = new Set()
+
+const sendWebSocketFrame = (socket, payload) => {
+  if (socket.destroyed) return
+
+  const data = Buffer.from(JSON.stringify(payload))
+  let header
+  if (data.length < 126) {
+    header = Buffer.from([0x81, data.length])
+  } else if (data.length <= 0xffff) {
+    header = Buffer.alloc(4)
+    header[0] = 0x81
+    header[1] = 126
+    header.writeUInt16BE(data.length, 2)
+  } else {
+    header = Buffer.alloc(10)
+    header[0] = 0x81
+    header[1] = 127
+    header.writeBigUInt64BE(BigInt(data.length), 2)
+  }
+
+  socket.write(Buffer.concat([header, data]))
+}
+
+const emitWebSocketEvent = (type, data) => {
+  const payload = {
+    type,
+    timestamp: now(),
+    data
+  }
+
+  for (const socket of wsClients) {
+    try {
+      sendWebSocketFrame(socket, payload)
+    } catch {
+      wsClients.delete(socket)
+      socket.destroy()
+    }
+  }
+}
 
 const log = (event, details = {}) => {
   const payload = { timestamp: now(), event, ...details }
   console.log(JSON.stringify(payload))
   io.emit('sessionEvent', payload)
+  emitWebSocketEvent('sessionEvent', payload)
 }
 
 const emitStatus = () => {
   status.updatedAt = Date.now()
   io.emit('status', status)
+  emitWebSocketEvent('status', status)
+}
+
+const emitConfig = () => {
+  io.emit('config', config)
+  emitWebSocketEvent('config', config)
+}
+
+const emitRuntimeMessage = (message) => {
+  io.emit('runtimeMessage', message)
+  emitWebSocketEvent('runtimeMessage', message)
 }
 
 const setStatus = (update) => {
@@ -193,6 +249,7 @@ const loadDependencies = () => {
     constructorName: NativeCarplay.name || '(anonymous)',
     nodeCarplayNodeExports: Object.keys(nativeModule),
     configPath: CONFIG_PATH,
+    host: HOST,
     port: PORT
   })
 }
@@ -241,7 +298,7 @@ const setConfig = (update) => {
     ...update
   }
   persistConfig()
-  io.emit('config', config)
+  emitConfig()
   return config
 }
 
@@ -435,12 +492,12 @@ const attachMessageHandler = () => {
           })
         }
         setStatus({ receivingVideo: true })
-        io.emit('runtimeMessage', { type, message: summarize(message?.message) })
+        emitRuntimeMessage({ type, message: summarize(message?.message) })
         break
       case 'audio':
       case 'media':
       case 'command':
-        io.emit('runtimeMessage', { type, message: summarize(message?.message) })
+        emitRuntimeMessage({ type, message: summarize(message?.message) })
         log('runtimeMessage', {
           type,
           message: summarize(message?.message)
@@ -451,7 +508,7 @@ const attachMessageHandler = () => {
         setSession('error', { lastError: 'node-carplay/native reported failure' })
         break
       default:
-        io.emit('runtimeMessage', { type, message: summarize(message) })
+        emitRuntimeMessage({ type, message: summarize(message) })
         log('runtimeMessage', {
           type,
           message: summarize(message)
@@ -639,6 +696,153 @@ const reply = async (handler, callback) => {
   }
 }
 
+const sendJson = (response, statusCode, payload) => {
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': 'http://127.0.0.1',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
+  })
+  response.end(`${JSON.stringify(payload, null, 2)}\n`)
+}
+
+const readJsonBody = (request) =>
+  new Promise((resolve, reject) => {
+    let body = ''
+    request.on('data', (chunk) => {
+      body += chunk
+      if (body.length > 1024 * 1024) {
+        reject(new Error('Request body too large'))
+        request.destroy()
+      }
+    })
+    request.on('end', () => {
+      if (!body.trim()) {
+        resolve({})
+        return
+      }
+      try {
+        resolve(JSON.parse(body))
+      } catch (error) {
+        reject(new Error(`Invalid JSON body: ${getErrorMessage(error)}`))
+      }
+    })
+    request.on('error', reject)
+  })
+
+const handleHttpOperation = async (response, handler) => {
+  try {
+    const result = await handler()
+    sendJson(response, 200, result)
+  } catch (error) {
+    const message = getErrorMessage(error)
+    log('sessionError', { error: message, stack: getErrorStack(error), source: 'http' })
+    sendJson(response, 400, { error: message })
+  }
+}
+
+const handleHttpRequest = async (request, response) => {
+  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `${HOST}:${PORT}`}`)
+  const method = request.method ?? 'GET'
+
+  if (method === 'OPTIONS') {
+    sendJson(response, 204, {})
+    return
+  }
+
+  if (method === 'GET' && url.pathname === '/status') {
+    sendJson(response, 200, status)
+    return
+  }
+
+  if (method === 'GET' && url.pathname === '/config') {
+    sendJson(response, 200, config)
+    return
+  }
+
+  if (method === 'POST' && url.pathname === '/start') {
+    await handleHttpOperation(response, startSession)
+    return
+  }
+
+  if (method === 'POST' && url.pathname === '/stop') {
+    await handleHttpOperation(response, stopSession)
+    return
+  }
+
+  if (method === 'POST' && url.pathname === '/restart') {
+    await handleHttpOperation(response, restartSession)
+    return
+  }
+
+  if (method === 'POST' && url.pathname === '/camera') {
+    await handleHttpOperation(response, async () => {
+      const body = await readJsonBody(request)
+      return showCamera(body.visible)
+    })
+    return
+  }
+
+  if (method === 'POST' && url.pathname === '/config') {
+    await handleHttpOperation(response, async () => {
+      const body = await readJsonBody(request)
+      return setConfig(body)
+    })
+    return
+  }
+
+  sendJson(response, 404, {
+    error: 'Not found',
+    endpoints: ['GET /status', 'GET /config', 'POST /start', 'POST /stop', 'POST /restart', 'POST /camera', 'POST /config']
+  })
+}
+
+const acceptWebSocket = (request, socket) => {
+  const key = request.headers['sec-websocket-key']
+  if (!key) {
+    socket.destroy()
+    return
+  }
+
+  const accept = crypto.createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+  socket.write(
+    [
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${accept}`,
+      '',
+      ''
+    ].join('\r\n')
+  )
+
+  wsClients.add(socket)
+  socket.on('close', () => wsClients.delete(socket))
+  socket.on('error', () => {
+    wsClients.delete(socket)
+    socket.destroy()
+  })
+  socket.on('data', (buffer) => {
+    const opcode = buffer[0] & 0x0f
+    if (opcode === 0x8) {
+      wsClients.delete(socket)
+      socket.end()
+    } else if (opcode === 0x9) {
+      socket.write(Buffer.from([0x8a, 0x00]))
+    }
+  })
+
+  sendWebSocketFrame(socket, {
+    type: 'hello',
+    timestamp: now(),
+    data: {
+      status,
+      config
+    }
+  })
+}
+
 const registerSocketApi = () => {
   io.on('connection', (socket) => {
     socket.emit('config', config)
@@ -657,19 +861,36 @@ const registerSocketApi = () => {
 
 const shutdown = async () => {
   await stopSession()
+  for (const socket of wsClients) {
+    socket.end()
+  }
+  wsClients.clear()
   io.close()
+  httpServer?.close()
 }
 
 const main = async () => {
   loadDependencies()
   loadConfig()
   registerSocketApi()
-  io.listen(PORT)
-  io.emit('config', config)
+  httpServer = http.createServer(handleHttpRequest)
+  httpServer.on('upgrade', (request, socket) => {
+    const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `${HOST}:${PORT}`}`)
+    if (url.pathname === '/events') {
+      acceptWebSocket(request, socket)
+    }
+  })
+  io.attach(httpServer)
+  httpServer.listen(PORT, HOST)
+  emitConfig()
   emitStatus()
 
   log('nativeRuntimeServiceListening', {
+    host: HOST,
     port: PORT,
+    httpBaseUrl: `http://${HOST}:${PORT}`,
+    webSocketUrl: `ws://${HOST}:${PORT}/events`,
+    socketIoUrl: `http://${HOST}:${PORT}`,
     configPath: CONFIG_PATH,
     autoStart: AUTO_START
   })

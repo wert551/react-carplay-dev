@@ -172,7 +172,7 @@ npm run native:control -- showCamera true
 npm run native:control -- setConfig '{"startMode":"manual"}'
 ```
 
-The service listens on Socket.IO port `4100` by default. Override with `CARPLAY_NATIVE_PORT`.
+The service listens on `127.0.0.1:4100` by default. Override with `CARPLAY_NATIVE_HOST` and `CARPLAY_NATIVE_PORT`.
 
 Supported request events:
 
@@ -195,12 +195,141 @@ Published events:
 Important environment variables:
 
 - `CARPLAY_NATIVE_CONFIG=/path/to/config.json`: Config file path. Defaults to `~/.config/react-carplay/config.json`.
-- `CARPLAY_NATIVE_PORT=4100`: Socket.IO control port.
+- `CARPLAY_NATIVE_HOST=127.0.0.1`: Local bind host. Keep this loopback-only for in-car use unless you intentionally expose it.
+- `CARPLAY_NATIVE_PORT=4100`: Shared local service port for HTTP, WebSocket, and Socket.IO.
 - `CARPLAY_NATIVE_AUTOSTART=1`: Start a session when the service boots.
 - `CARPLAY_NATIVE_START_RETRIES=2`: Retry startup after recoverable reset/re-enumeration failures.
 - `CARPLAY_NATIVE_REDISCOVERY_TIMEOUT_MS=30000`: Maximum time to wait for dongle re-enumeration.
 - `CARPLAY_NATIVE_STOP_RESET_TIMEOUT_MS=2500`: Reset timeout used during shutdown to settle pending USB transfers.
 - `CARPLAY_NATIVE_CLOSE_TIMEOUT_MS=1000`: Close timeout used during shutdown after reset.
+
+### Qt-Friendly HTTP API
+
+The native service also exposes ordinary local HTTP endpoints on the same host and port:
+
+```text
+http://127.0.0.1:4100
+```
+
+Endpoints:
+
+- `GET /status`
+- `GET /config`
+- `POST /start`
+- `POST /stop`
+- `POST /restart`
+- `POST /camera`
+- `POST /config`
+
+Examples:
+
+```sh
+curl http://127.0.0.1:4100/status
+curl http://127.0.0.1:4100/config
+curl -X POST http://127.0.0.1:4100/start
+curl -X POST http://127.0.0.1:4100/stop
+curl -X POST http://127.0.0.1:4100/restart
+curl -X POST http://127.0.0.1:4100/camera \
+  -H 'Content-Type: application/json' \
+  -d '{"visible":true}'
+curl -X POST http://127.0.0.1:4100/config \
+  -H 'Content-Type: application/json' \
+  -d '{"startMode":"manual","runtimeEngine":"external"}'
+```
+
+Successful responses return the current resource directly. For example, `GET /status` and `POST /start` return a status object:
+
+```json
+{
+  "desiredSession": "running",
+  "session": "waiting_for_phone",
+  "isPlugged": false,
+  "deviceFound": true,
+  "receivingVideo": false,
+  "cameraVisible": false,
+  "lastError": null,
+  "metadata": {
+    "runtimeEngine": "native-node",
+    "configPath": "/home/pi/.config/react-carplay/config.json",
+    "port": 4100
+  },
+  "messageCounts": {
+    "audio": 0,
+    "video": 0,
+    "media": 0,
+    "command": 0,
+    "nativeMessage": 0
+  }
+}
+```
+
+`GET /config` and `POST /config` return the active config JSON. Errors return HTTP `400` with:
+
+```json
+{
+  "error": "config must be an object"
+}
+```
+
+### Qt-Friendly WebSocket Events
+
+Plain WebSocket clients can subscribe to pushed updates at:
+
+```text
+ws://127.0.0.1:4100/events
+```
+
+Each pushed frame is JSON:
+
+```json
+{
+  "type": "status",
+  "timestamp": "2026-04-22T12:00:00.000Z",
+  "data": {
+    "session": "connected",
+    "desiredSession": "running",
+    "isPlugged": true,
+    "deviceFound": true
+  }
+}
+```
+
+Event `type` values:
+
+- `hello`: Initial snapshot containing `status` and `config`.
+- `status`: Full status object.
+- `config`: Full config object.
+- `sessionEvent`: Structured lifecycle/log event.
+- `runtimeMessage`: Summarized native `command`, `media`, `audio`, or `video` message.
+
+Example `sessionEvent`:
+
+```json
+{
+  "type": "sessionEvent",
+  "timestamp": "2026-04-22T12:00:01.000Z",
+  "data": {
+    "timestamp": "2026-04-22T12:00:01.000Z",
+    "event": "phoneConnected"
+  }
+}
+```
+
+Example `runtimeMessage`:
+
+```json
+{
+  "type": "runtimeMessage",
+  "timestamp": "2026-04-22T12:00:02.000Z",
+  "data": {
+    "type": "audio",
+    "message": {
+      "type": "AudioData",
+      "byteLength": 4096
+    }
+  }
+}
+```
 
 ### Native Startup Patch
 
