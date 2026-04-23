@@ -21,6 +21,26 @@ const WIFI_PAIR_DELAY_MS = Number(process.env.CARPLAY_NATIVE_WIFI_PAIR_DELAY_MS 
 const USB_STOP_RESET_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_STOP_RESET_TIMEOUT_MS ?? 2500)
 const USB_CLOSE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_CLOSE_TIMEOUT_MS ?? 1000)
 const AUTO_START = process.env.CARPLAY_NATIVE_AUTOSTART === '1'
+const H264_NAL_TYPES = {
+  IDR: 5,
+  SPS: 7,
+  PPS: 8
+}
+const TOUCH_ACTION_NAMES = new Set(['down', 'move', 'up'])
+const KEY_COMMANDS = new Set([
+  'home',
+  'back',
+  'left',
+  'right',
+  'down',
+  'selectDown',
+  'selectUp',
+  'play',
+  'pause',
+  'next',
+  'prev',
+  'frame'
+])
 
 let nativeModule = null
 let usbModule = null
@@ -58,6 +78,22 @@ const status = {
     command: 0,
     nativeMessage: 0
   }
+}
+
+const videoDiagnostics = {
+  codec: 'h264',
+  format: null,
+  width: null,
+  height: null,
+  fps: null,
+  totalFrames: 0,
+  keyframeCount: 0,
+  lastFrameAt: null,
+  streamingActive: false,
+  hasSps: false,
+  hasPps: false,
+  lastPayloadBytes: 0,
+  lastNalTypes: []
 }
 
 const now = () => new Date().toISOString()
@@ -221,6 +257,347 @@ const formatWebUsbDevice = (device) => {
     serialNumber: device.serialNumber,
     opened: device.opened
   }
+}
+
+const toUint8Array = (value) => {
+  if (value == null) return null
+  if (value instanceof Uint8Array) return value
+  if (Buffer.isBuffer(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+  if (value instanceof ArrayBuffer) return new Uint8Array(value)
+  return null
+}
+
+const findAnnexBStartCode = (data, offset) => {
+  for (let i = offset; i <= data.length - 3; i += 1) {
+    if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) return { index: i, length: 3 }
+    if (i <= data.length - 4 && data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+      return { index: i, length: 4 }
+    }
+  }
+  return null
+}
+
+const extractAnnexBNalus = (data) => {
+  const nalus = []
+  let start = findAnnexBStartCode(data, 0)
+  if (!start) return null
+
+  while (start) {
+    const payloadStart = start.index + start.length
+    const next = findAnnexBStartCode(data, payloadStart)
+    const payloadEnd = next ? next.index : data.length
+    if (payloadEnd > payloadStart) {
+      nalus.push(data.subarray(payloadStart, payloadEnd))
+    }
+    start = next
+  }
+
+  return nalus.length > 0 ? nalus : null
+}
+
+const extractLengthPrefixedNalus = (data) => {
+  for (const prefixLength of [4, 3, 2, 1]) {
+    const nalus = []
+    let offset = 0
+
+    while (offset + prefixLength <= data.length) {
+      let length = 0
+      for (let i = 0; i < prefixLength; i += 1) {
+        length = (length << 8) | data[offset + i]
+      }
+
+      offset += prefixLength
+      if (length <= 0 || offset + length > data.length) {
+        nalus.length = 0
+        break
+      }
+
+      nalus.push(data.subarray(offset, offset + length))
+      offset += length
+    }
+
+    if (nalus.length > 0 && offset === data.length) {
+      return { nalus, format: `h264-length-prefixed-${prefixLength}` }
+    }
+  }
+
+  return null
+}
+
+const extractH264Nalus = (data) => {
+  const annexBNalus = extractAnnexBNalus(data)
+  if (annexBNalus) {
+    return { nalus: annexBNalus, format: 'h264-annexb' }
+  }
+
+  const lengthPrefixed = extractLengthPrefixedNalus(data)
+  if (lengthPrefixed) {
+    return lengthPrefixed
+  }
+
+  return { nalus: [data], format: 'h264-unknown' }
+}
+
+class BitReader {
+  constructor(data) {
+    this.data = data
+    this.bitOffset = 0
+  }
+
+  readBit() {
+    if (this.bitOffset >= this.data.length * 8) throw new Error('SPS bitstream ended early')
+    const byte = this.data[this.bitOffset >> 3]
+    const bit = 7 - (this.bitOffset & 7)
+    this.bitOffset += 1
+    return (byte >> bit) & 1
+  }
+
+  readBits(count) {
+    let value = 0
+    for (let i = 0; i < count; i += 1) {
+      value = value * 2 + this.readBit()
+    }
+    return value
+  }
+
+  readUnsignedExpGolomb() {
+    let zeros = 0
+    while (this.readBit() === 0) {
+      zeros += 1
+      if (zeros > 31) throw new Error('Invalid SPS Exp-Golomb code')
+    }
+    return Math.pow(2, zeros) - 1 + (zeros > 0 ? this.readBits(zeros) : 0)
+  }
+
+  readSignedExpGolomb() {
+    const value = this.readUnsignedExpGolomb()
+    return value % 2 === 0 ? -(value / 2) : (value + 1) / 2
+  }
+}
+
+const removeEmulationPreventionBytes = (data) => {
+  const bytes = []
+  for (let i = 0; i < data.length; i += 1) {
+    if (i >= 2 && data[i] === 0x03 && data[i - 1] === 0x00 && data[i - 2] === 0x00) {
+      continue
+    }
+    bytes.push(data[i])
+  }
+  return Uint8Array.from(bytes)
+}
+
+const skipHrdParameters = (reader) => {
+  const cpbCount = reader.readUnsignedExpGolomb() + 1
+  reader.readBits(4)
+  reader.readBits(4)
+  for (let i = 0; i < cpbCount; i += 1) {
+    reader.readUnsignedExpGolomb()
+    reader.readUnsignedExpGolomb()
+    reader.readBit()
+  }
+  reader.readBits(5)
+  reader.readBits(5)
+  reader.readBits(5)
+  reader.readBits(5)
+}
+
+const parseSpsInfo = (spsNalu) => {
+  try {
+    const rbsp = removeEmulationPreventionBytes(spsNalu.subarray(1))
+    const reader = new BitReader(rbsp)
+    const profileIdc = reader.readBits(8)
+    reader.readBits(8)
+    reader.readBits(8)
+    reader.readUnsignedExpGolomb()
+
+    let chromaFormatIdc = 1
+    if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(profileIdc)) {
+      chromaFormatIdc = reader.readUnsignedExpGolomb()
+      if (chromaFormatIdc === 3) reader.readBit()
+      reader.readUnsignedExpGolomb()
+      reader.readUnsignedExpGolomb()
+      reader.readBit()
+      if (reader.readBit()) {
+        const scalingListCount = chromaFormatIdc !== 3 ? 8 : 12
+        for (let i = 0; i < scalingListCount; i += 1) {
+          if (reader.readBit()) {
+            let lastScale = 8
+            let nextScale = 8
+            const size = i < 6 ? 16 : 64
+            for (let j = 0; j < size; j += 1) {
+              if (nextScale !== 0) {
+                nextScale = (lastScale + reader.readSignedExpGolomb() + 256) % 256
+              }
+              lastScale = nextScale === 0 ? lastScale : nextScale
+            }
+          }
+        }
+      }
+    }
+
+    reader.readUnsignedExpGolomb()
+    const picOrderCntType = reader.readUnsignedExpGolomb()
+    if (picOrderCntType === 0) {
+      reader.readUnsignedExpGolomb()
+    } else if (picOrderCntType === 1) {
+      reader.readBit()
+      reader.readSignedExpGolomb()
+      reader.readSignedExpGolomb()
+      const offsets = reader.readUnsignedExpGolomb()
+      for (let i = 0; i < offsets; i += 1) {
+        reader.readSignedExpGolomb()
+      }
+    }
+
+    reader.readUnsignedExpGolomb()
+    reader.readBit()
+    const picWidthInMbsMinus1 = reader.readUnsignedExpGolomb()
+    const picHeightInMapUnitsMinus1 = reader.readUnsignedExpGolomb()
+    const frameMbsOnlyFlag = reader.readBit()
+    if (!frameMbsOnlyFlag) reader.readBit()
+    reader.readBit()
+
+    let frameCropLeftOffset = 0
+    let frameCropRightOffset = 0
+    let frameCropTopOffset = 0
+    let frameCropBottomOffset = 0
+    if (reader.readBit()) {
+      frameCropLeftOffset = reader.readUnsignedExpGolomb()
+      frameCropRightOffset = reader.readUnsignedExpGolomb()
+      frameCropTopOffset = reader.readUnsignedExpGolomb()
+      frameCropBottomOffset = reader.readUnsignedExpGolomb()
+    }
+
+    const subWidthC = chromaFormatIdc === 0 || chromaFormatIdc === 3 ? 1 : 2
+    const subHeightC = chromaFormatIdc === 1 ? 2 : 1
+    const cropUnitX = chromaFormatIdc === 0 ? 1 : subWidthC
+    const cropUnitY = chromaFormatIdc === 0 ? 2 - frameMbsOnlyFlag : subHeightC * (2 - frameMbsOnlyFlag)
+    const width =
+      (picWidthInMbsMinus1 + 1) * 16 - (frameCropLeftOffset + frameCropRightOffset) * cropUnitX
+    const height =
+      (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1) * 16 -
+      (frameCropTopOffset + frameCropBottomOffset) * cropUnitY
+
+    let fps = null
+    if (reader.readBit()) {
+      if (reader.readBit()) {
+        const aspectRatioIdc = reader.readBits(8)
+        if (aspectRatioIdc === 255) {
+          reader.readBits(16)
+          reader.readBits(16)
+        }
+      }
+      if (reader.readBit()) reader.readBit()
+      if (reader.readBit()) {
+        reader.readBits(3)
+        reader.readBit()
+        if (reader.readBit()) {
+          reader.readBits(8)
+          reader.readBits(8)
+          reader.readBits(8)
+        }
+      }
+      if (reader.readBit()) {
+        reader.readUnsignedExpGolomb()
+        reader.readUnsignedExpGolomb()
+      }
+      if (reader.readBit()) {
+        const numUnitsInTick = reader.readBits(32)
+        const timeScale = reader.readBits(32)
+        reader.readBit()
+        if (numUnitsInTick > 0 && timeScale > 0) {
+          fps = timeScale / (2 * numUnitsInTick)
+        }
+      }
+      if (reader.readBit()) skipHrdParameters(reader)
+      if (reader.readBit()) skipHrdParameters(reader)
+    }
+
+    return { width, height, fps }
+  } catch (error) {
+    log('runtimeMessage', {
+      type: 'videoDiagnosticsWarning',
+      warning: getErrorMessage(error)
+    })
+    return null
+  }
+}
+
+const resetVideoDiagnostics = () => {
+  Object.assign(videoDiagnostics, {
+    format: null,
+    width: null,
+    height: null,
+    fps: null,
+    totalFrames: 0,
+    keyframeCount: 0,
+    lastFrameAt: null,
+    streamingActive: false,
+    hasSps: false,
+    hasPps: false,
+    lastPayloadBytes: 0,
+    lastNalTypes: []
+  })
+}
+
+const getVideoStatus = () => ({
+  available: videoDiagnostics.totalFrames > 0,
+  codec: videoDiagnostics.codec,
+  format: videoDiagnostics.format,
+  width: videoDiagnostics.width,
+  height: videoDiagnostics.height,
+  fps: videoDiagnostics.fps,
+  totalFrames: videoDiagnostics.totalFrames,
+  keyframeCount: videoDiagnostics.keyframeCount,
+  lastFrameAt: videoDiagnostics.lastFrameAt,
+  streamingActive: status.receivingVideo && status.session === 'connected',
+  hasSps: videoDiagnostics.hasSps,
+  hasPps: videoDiagnostics.hasPps,
+  lastPayloadBytes: videoDiagnostics.lastPayloadBytes,
+  lastNalTypes: videoDiagnostics.lastNalTypes,
+  binaryStreamAvailable: false
+})
+
+const updateVideoDiagnostics = (message) => {
+  const data = toUint8Array(message?.data)
+  const observedAt = Date.now()
+
+  videoDiagnostics.totalFrames += 1
+  videoDiagnostics.lastFrameAt = observedAt
+  videoDiagnostics.streamingActive = true
+
+  if (!data) {
+    videoDiagnostics.lastPayloadBytes = 0
+    return
+  }
+
+  videoDiagnostics.lastPayloadBytes = data.byteLength
+  const { nalus, format } = extractH264Nalus(data)
+  videoDiagnostics.format = format
+  const nalTypes = []
+
+  for (const nalu of nalus) {
+    if (nalu.byteLength === 0) continue
+    const nalType = nalu[0] & 0x1f
+    nalTypes.push(nalType)
+
+    if (nalType === H264_NAL_TYPES.IDR) {
+      videoDiagnostics.keyframeCount += 1
+    } else if (nalType === H264_NAL_TYPES.SPS) {
+      videoDiagnostics.hasSps = true
+      const info = parseSpsInfo(nalu)
+      if (info) {
+        videoDiagnostics.width = info.width
+        videoDiagnostics.height = info.height
+        if (info.fps) videoDiagnostics.fps = info.fps
+      }
+    } else if (nalType === H264_NAL_TYPES.PPS) {
+      videoDiagnostics.hasPps = true
+    }
+  }
+
+  videoDiagnostics.lastNalTypes = nalTypes.slice(0, 12)
 }
 
 const loadDependencies = () => {
@@ -491,6 +868,7 @@ const attachMessageHandler = () => {
             deviceFound: true
           })
         }
+        updateVideoDiagnostics(message?.message)
         setStatus({ receivingVideo: true })
         emitRuntimeMessage({ type, message: summarize(message?.message) })
         break
@@ -551,6 +929,7 @@ const startSession = async () => {
       stoppedAt: null,
       receivingVideo: false
     })
+    resetVideoDiagnostics()
 
     for (let attempt = 0; attempt <= START_RETRY_LIMIT && !stopping; attempt += 1) {
       if (attempt > 0) {
@@ -667,6 +1046,7 @@ const stopSession = async () => {
       receivingVideo: false,
       stoppedAt: Date.now()
     })
+    resetVideoDiagnostics()
     return status
   })().finally(() => {
     stopPromise = null
@@ -683,6 +1063,98 @@ const restartSession = async () => {
 const showCamera = (visible = true) => {
   setStatus({ cameraVisible: Boolean(visible) })
   return status
+}
+
+const getNativeExport = (...names) => {
+  for (const name of names) {
+    const candidate = nativeModule?.[name] ?? nativeModule?.default?.[name]
+    if (candidate != null) return candidate
+  }
+  return null
+}
+
+const assertInputRuntimeReady = () => {
+  if (!carplay?.dongleDriver || typeof carplay.dongleDriver.send !== 'function') {
+    throw new Error('CarPlay runtime is not active')
+  }
+  if (status.session !== 'connected') {
+    throw new Error(`CarPlay input is only accepted while session is connected; current session is ${status.session}`)
+  }
+}
+
+const resolveTouchAction = (actionName) => {
+  const actionKey = typeof actionName === 'string' ? actionName.toLowerCase() : ''
+  if (!TOUCH_ACTION_NAMES.has(actionKey)) {
+    throw new Error('touch action must be one of: down, move, up')
+  }
+
+  const touchAction =
+    getNativeExport('TouchAction', 'TouchActions', 'touchAction') ??
+    nativeModule?.SendTouch?.TouchAction ??
+    nativeModule?.SendTouch?.TouchActions
+  if (!touchAction || typeof touchAction !== 'object') {
+    throw new Error('node-carplay/node does not expose TouchAction')
+  }
+
+  const aliases = {
+    down: ['Down', 'DOWN', 'down'],
+    move: ['Move', 'MOVE', 'move'],
+    up: ['Up', 'UP', 'up']
+  }
+  for (const alias of aliases[actionKey]) {
+    if (touchAction[alias] != null) return touchAction[alias]
+  }
+
+  throw new Error(`node-carplay/node TouchAction does not expose ${actionKey}`)
+}
+
+const sendTouchInput = (body) => {
+  assertInputRuntimeReady()
+  const SendTouch = getNativeExport('SendTouch')
+  if (typeof SendTouch !== 'function') {
+    throw new Error('node-carplay/node does not expose SendTouch')
+  }
+
+  const x = Number(body.x)
+  const y = Number(body.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+    throw new Error('touch x and y must be finite normalized values from 0.0 to 1.0')
+  }
+
+  const action = String(body.action ?? '').toLowerCase()
+  const touchAction = resolveTouchAction(action)
+  carplay.dongleDriver.send(new SendTouch(x, y, touchAction))
+  return {
+    ok: true,
+    type: 'touch',
+    action,
+    x,
+    y,
+    session: status.session
+  }
+}
+
+const sendKeyInput = (body) => {
+  assertInputRuntimeReady()
+  const SendCommand = getNativeExport('SendCommand')
+  if (typeof SendCommand !== 'function') {
+    throw new Error('node-carplay/node does not expose SendCommand')
+  }
+
+  const command = String(body.command ?? '')
+  if (!KEY_COMMANDS.has(command)) {
+    throw new Error(
+      `key command must be one of: ${Array.from(KEY_COMMANDS).join(', ')}`
+    )
+  }
+
+  carplay.dongleDriver.send(new SendCommand(command))
+  return {
+    ok: true,
+    type: 'key',
+    command,
+    session: status.session
+  }
 }
 
 const reply = async (handler, callback) => {
@@ -761,6 +1233,11 @@ const handleHttpRequest = async (request, response) => {
     return
   }
 
+  if (method === 'GET' && url.pathname === '/video/status') {
+    sendJson(response, 200, getVideoStatus())
+    return
+  }
+
   if (method === 'POST' && url.pathname === '/start') {
     await handleHttpOperation(response, startSession)
     return
@@ -784,6 +1261,22 @@ const handleHttpRequest = async (request, response) => {
     return
   }
 
+  if (method === 'POST' && url.pathname === '/input/touch') {
+    await handleHttpOperation(response, async () => {
+      const body = await readJsonBody(request)
+      return sendTouchInput(body)
+    })
+    return
+  }
+
+  if (method === 'POST' && url.pathname === '/input/key') {
+    await handleHttpOperation(response, async () => {
+      const body = await readJsonBody(request)
+      return sendKeyInput(body)
+    })
+    return
+  }
+
   if (method === 'POST' && url.pathname === '/config') {
     await handleHttpOperation(response, async () => {
       const body = await readJsonBody(request)
@@ -794,7 +1287,18 @@ const handleHttpRequest = async (request, response) => {
 
   sendJson(response, 404, {
     error: 'Not found',
-    endpoints: ['GET /status', 'GET /config', 'POST /start', 'POST /stop', 'POST /restart', 'POST /camera', 'POST /config']
+    endpoints: [
+      'GET /status',
+      'GET /config',
+      'GET /video/status',
+      'POST /start',
+      'POST /stop',
+      'POST /restart',
+      'POST /camera',
+      'POST /input/touch',
+      'POST /input/key',
+      'POST /config'
+    ]
   })
 }
 
