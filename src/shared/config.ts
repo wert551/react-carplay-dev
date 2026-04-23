@@ -33,6 +33,7 @@ export type StartMode = 'auto' | 'manual'
 export type ShellMode = 'standalone' | 'hosted'
 export type RuntimeEngine = 'browser-webusb' | 'external'
 export type VideoRenderer = 'webgl' | 'webgl2' | 'webgpu'
+export type VideoDecoderAcceleration = 'no-preference' | 'prefer-hardware' | 'prefer-software'
 
 export type ExtraConfig = DongleConfig & {
   kiosk: boolean
@@ -44,6 +45,7 @@ export type ExtraConfig = DongleConfig & {
   shellMode: ShellMode
   runtimeEngine: RuntimeEngine
   videoRenderer: VideoRenderer
+  videoDecoderAcceleration: VideoDecoderAcceleration
   showDebugSettings: boolean
   bindings: KeyBindings
   most?: Most
@@ -80,6 +82,7 @@ export const createDefaultConfig = (dongleDefaults: DongleConfig): ExtraConfig =
   shellMode: 'standalone',
   runtimeEngine: 'browser-webusb',
   videoRenderer: 'webgl2',
+  videoDecoderAcceleration: 'prefer-hardware',
   showDebugSettings: true,
   bindings: DEFAULT_BINDINGS,
   most: {},
@@ -144,6 +147,10 @@ export const validateConfig = (
 
   if (!['webgl', 'webgl2', 'webgpu'].includes(config.videoRenderer)) {
     errors.push('videoRenderer must be "webgl", "webgl2", or "webgpu"')
+  }
+
+  if (!['no-preference', 'prefer-hardware', 'prefer-software'].includes(config.videoDecoderAcceleration)) {
+    errors.push('videoDecoderAcceleration must be "no-preference", "prefer-hardware", or "prefer-software"')
   }
 
   if (typeof config.showDebugSettings !== 'boolean') {

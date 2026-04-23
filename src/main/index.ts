@@ -8,7 +8,7 @@ import { Socket } from './Socket'
 import {Canbus} from "./Canbus"
 
 import { ExtraConfig, createDefaultConfig } from '../shared/config'
-import type { VideoRenderer } from '../shared/config'
+import type { VideoDecoderAcceleration, VideoRenderer } from '../shared/config'
 import { CarplayStatusUpdate, CONTROL_CHANNELS, SessionAdapterEvent } from '../shared/control'
 import { ConfigStore } from './ConfigStore'
 import { RuntimeControl } from './RuntimeControl'
@@ -40,16 +40,38 @@ const getPiVideoRenderer = (): VideoRenderer => {
   }
 }
 
+const getPiVideoDecoderAcceleration = (): VideoDecoderAcceleration => {
+  const acceleration = process.env.REACT_CARPLAY_VIDEO_DECODER
+  switch (acceleration) {
+    case 'no-preference':
+    case 'prefer-hardware':
+    case 'prefer-software':
+      return acceleration
+    default:
+      return 'prefer-hardware'
+  }
+}
+
+const getPiGlProfile = () => {
+  return process.env.REACT_CARPLAY_GL === 'egl-gles2' ? 'egl-gles2' : 'egl-angle'
+}
+
 const configureChromiumRuntime = () => {
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
   app.commandLine.appendSwitch('disable-webusb-security', 'true')
 
   if (isPiRuntimeProfile()) {
+    const glProfile = getPiGlProfile()
     app.commandLine.appendSwitch('disable-features', 'Vulkan,WebGPU')
     app.commandLine.appendSwitch('ignore-gpu-blocklist')
     app.commandLine.appendSwitch('enable-gpu-rasterization')
-    app.commandLine.appendSwitch('use-gl', 'egl-gles2')
-    console.log('React-CarPlay Pi runtime profile enabled: WebGPU/Vulkan disabled, WebGL via EGL/GLES2 preferred')
+    app.commandLine.appendSwitch('use-gl', glProfile)
+    if (glProfile === 'egl-angle') {
+      app.commandLine.appendSwitch('use-angle', 'default')
+    } else {
+      app.commandLine.appendSwitch('use-angle', 'none')
+    }
+    console.log(`React-CarPlay Pi runtime profile enabled: WebGPU/Vulkan disabled, WebGL via ${glProfile} preferred`)
   } else {
     app.commandLine.appendSwitch('enable-experimental-web-platform-features')
   }
@@ -199,7 +221,10 @@ const initializeServices = () => {
   configStore = new ConfigStore(configPath, defaults)
   configStore.load()
   if (isPiRuntimeProfile()) {
-    configStore.setConfig({ videoRenderer: getPiVideoRenderer() })
+    configStore.setConfig({
+      videoRenderer: getPiVideoRenderer(),
+      videoDecoderAcceleration: getPiVideoDecoderAcceleration()
+    })
   }
   runtimeControl = new RuntimeControl(configStore)
   socket = new Socket(runtimeControl)

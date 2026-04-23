@@ -1,6 +1,7 @@
 // Based on https://github.com/codewithpassion/foxglove-studio-h264-extension/tree/main
 // MIT License
 import { Bitstream, NALUStream, SPS } from './h264-utils'
+import type { VideoDecoderAcceleration } from '../../../../../../shared/config'
 
 type GetNaluResult = { type: NaluTypes; nalu: Uint8Array; rawNalu: Uint8Array }
 
@@ -38,7 +39,10 @@ function isKeyFrame(frameData: Uint8Array): boolean {
   return Boolean(idr)
 }
 
-function getDecoderConfig(frameData: Uint8Array): VideoDecoderConfig | null {
+function getDecoderConfig(
+  frameData: Uint8Array,
+  hardwareAcceleration: VideoDecoderAcceleration = 'prefer-hardware'
+): VideoDecoderConfig | null {
   const spsNalu = getNaluFromStream(frameData, NaluTypes.SPS)
   if (spsNalu) {
     const sps = new SPS(spsNalu.nalu)
@@ -46,7 +50,7 @@ function getDecoderConfig(frameData: Uint8Array): VideoDecoderConfig | null {
       codec: sps.MIME,
       codedHeight: sps.picHeight,
       codedWidth: sps.picWidth,
-      hardwareAcceleration: 'prefer-software',
+      hardwareAcceleration,
     }
     return decoderConfig
   }

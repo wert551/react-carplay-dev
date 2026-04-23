@@ -122,12 +122,21 @@ export const useCarplaySessionAdapter = ({
       { type: 'module' }
     )
     const canvas = canvasElement.transferControlToOffscreen()
-    worker.postMessage(new InitEvent(canvas, channels.video.port2, settings.videoRenderer), [
-      canvas,
-      channels.video.port2
-    ])
+    worker.postMessage(
+      new InitEvent(
+        canvas,
+        channels.video.port2,
+        settings.videoRenderer,
+        false,
+        settings.videoDecoderAcceleration
+      ),
+      [
+        canvas,
+        channels.video.port2
+      ]
+    )
     return worker
-  }, [canvasElement, channels.video, settings.videoRenderer])
+  }, [canvasElement, channels.video, settings.videoDecoderAcceleration, settings.videoRenderer])
 
   useLayoutEffect(() => {
     if (canvasRef.current) {

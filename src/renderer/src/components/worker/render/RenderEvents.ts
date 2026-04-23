@@ -1,4 +1,4 @@
-import type { VideoRenderer } from '../../../../../shared/config'
+import type { VideoDecoderAcceleration, VideoRenderer } from '../../../../../shared/config'
 
 export type WorkerEventType = 'init' | 'frame' | 'renderDone'
 
@@ -22,5 +22,6 @@ export class InitEvent implements WorkerEvent {
     public videoPort: MessagePort,
     public renderer: Renderer = 'webgl',
     public reportFps: boolean = false,
+    public decoderAcceleration: VideoDecoderAcceleration = 'prefer-hardware',
   ) {}
 }

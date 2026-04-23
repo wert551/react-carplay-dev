@@ -6,6 +6,8 @@ import type { FrameRenderer } from './Render.worker'
 export class WebGLRenderer implements FrameRenderer {
   #canvas: OffscreenCanvas | null = null
   #ctx: WebGLRenderingContext | null = null
+  #textureWidth = 0
+  #textureHeight = 0
 
   static vertexShaderSource = `
       attribute vec2 xy;
@@ -98,28 +100,34 @@ export class WebGLRenderer implements FrameRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE)
   }
 
   draw(frame: VideoFrame): void {
+    const width = frame.displayWidth
+    const height = frame.displayHeight
+    const sizeChanged = width !== this.#textureWidth || height !== this.#textureHeight
+
     if (
       this.#canvas &&
-      (this.#canvas.width !== frame.displayWidth || this.#canvas.height !== frame.displayHeight)
+      (this.#canvas.width !== width || this.#canvas.height !== height)
     ) {
-      this.#canvas.width = frame.displayWidth
-      this.#canvas.height = frame.displayHeight
+      this.#canvas.width = width
+      this.#canvas.height = height
     }
 
     const gl = this.#ctx!
 
-    // Upload the frame.
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame as unknown as TexImageSource)
+    if (sizeChanged) {
+      this.#textureWidth = width
+      this.#textureHeight = height
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame as unknown as TexImageSource)
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, frame as unknown as TexImageSource)
+    }
     // eslint-disable-next-line @typescript-eslint/no-unsafe-call
     frame.close()
-
-    // Configure and clear the drawing area.
-    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight)
-    gl.clearColor(1.0, 0.0, 0.0, 1.0)
-    gl.clear(gl.COLOR_BUFFER_BIT)
 
     // Draw the frame.
     gl.drawArrays(gl.TRIANGLE_FAN, 0, 4)

@@ -16,6 +16,7 @@ const scope = self as unknown as DedicatedWorkerGlobalScope
 export class RenderWorker {
   private renderer: FrameRenderer | null = null
   private videoPort: MessagePort | null = null
+  private decoderAcceleration: InitEvent['decoderAcceleration'] = 'prefer-hardware'
   private pendingFrame: VideoFrame | null = null
   private startTime: number | null = null
   private frameCount = 0
@@ -89,6 +90,8 @@ export class RenderWorker {
         throw error
       }
     }
+    this.decoderAcceleration = event.decoderAcceleration
+    console.log(`Render worker using ${event.renderer} renderer with ${event.decoderAcceleration} decoder acceleration`)
     this.videoPort = event.videoPort
     this.videoPort.onmessage = ev => {
       this.onFrame(ev.data as RenderEvent)
@@ -107,7 +110,7 @@ export class RenderWorker {
     const frameData = new Uint8Array(event.frameData)
 
     if (this.decoder.state === 'unconfigured') {
-      const decoderConfig = getDecoderConfig(frameData)
+      const decoderConfig = getDecoderConfig(frameData, this.decoderAcceleration)
       if (decoderConfig) {
         this.decoder.configure(decoderConfig)
         console.log(decoderConfig)
