@@ -24,6 +24,7 @@ const WIFI_PAIR_DELAY_MS = Number(process.env.CARPLAY_NATIVE_WIFI_PAIR_DELAY_MS 
 const USB_STOP_RESET_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_STOP_RESET_TIMEOUT_MS ?? 2500)
 const USB_CLOSE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_CLOSE_TIMEOUT_MS ?? 1000)
 const USB_ACQUIRE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_ACQUIRE_TIMEOUT_MS ?? 15000)
+const USB_REQUEST_DEVICE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_REQUEST_DEVICE_TIMEOUT_MS ?? 3000)
 const AUTO_START = process.env.CARPLAY_NATIVE_AUTOSTART === '1'
 const H264_NAL_TYPES = {
   IDR: 5,
@@ -326,6 +327,30 @@ const formatDevice = (dongle) => {
     busNumber: dongle.busNumber,
     deviceAddress: dongle.deviceAddress
   }
+}
+
+const getDongleFilters = () =>
+  nativeModule.DongleDriver?.knownDevices ?? [
+    { vendorId: DONGLE_VENDOR_ID, productId: 0x1520 },
+    { vendorId: DONGLE_VENDOR_ID, productId: 0x1521 }
+  ]
+
+const formatFilters = (filters) =>
+  filters.map((filter) => ({
+    vendorId: typeof filter.vendorId === 'number' ? `0x${filter.vendorId.toString(16)}` : undefined,
+    productId: typeof filter.productId === 'number' ? `0x${filter.productId.toString(16)}` : undefined,
+    classCode: filter.classCode,
+    subclassCode: filter.subclassCode,
+    protocolCode: filter.protocolCode,
+    serialNumber: filter.serialNumber
+  }))
+
+const listMatchingDongles = () => {
+  if (!usbModule?.getDeviceList) return []
+  return usbModule.getDeviceList().filter((device) => {
+    const descriptor = device.deviceDescriptor
+    return descriptor?.idVendor === DONGLE_VENDOR_ID && DONGLE_PRODUCT_IDS.has(descriptor.idProduct)
+  })
 }
 
 const formatWebUsbDevice = (device) => {
@@ -792,6 +817,7 @@ const loadDependencies = () => {
     modulePath: require.resolve('node-carplay/node'),
     constructorName: NativeCarplay.name || '(anonymous)',
     nodeCarplayNodeExports: Object.keys(nativeModule),
+    usbSupportsWebUsbCreateInstance: typeof usbModule?.WebUSBDevice?.createInstance === 'function',
     configPath: CONFIG_PATH,
     host: HOST,
     port: PORT
@@ -921,13 +947,7 @@ const setConfig = (update) => {
 }
 
 const findDongle = () => {
-  if (!usbModule?.getDeviceList) return null
-  return (
-    usbModule.getDeviceList().find((device) => {
-      const descriptor = device.deviceDescriptor
-      return descriptor?.idVendor === DONGLE_VENDOR_ID && DONGLE_PRODUCT_IDS.has(descriptor.idProduct)
-    }) ?? null
-  )
+  return listMatchingDongles()[0] ?? null
 }
 
 const waitForDongle = async ({ rediscovery = false, timeoutMs = 0 } = {}) => {
@@ -939,9 +959,11 @@ const waitForDongle = async ({ rediscovery = false, timeoutMs = 0 } = {}) => {
   while (!stopping) {
     const dongle = findDongle()
     if (dongle) {
+      const matchingDongles = listMatchingDongles()
       log(rediscovery ? 'dongleRediscovered' : 'dongleFound', {
         elapsedMs: Date.now() - startedAt,
-        ...formatDevice(dongle)
+        ...formatDevice(dongle),
+        matchingDongles: matchingDongles.map(formatDevice)
       })
       setStatus({ deviceFound: true })
       return dongle
@@ -955,18 +977,31 @@ const waitForDongle = async ({ rediscovery = false, timeoutMs = 0 } = {}) => {
 }
 
 const requestWebUsbDongle = async ({ timeoutMs = 0 } = {}) => {
-  const filters = nativeModule.DongleDriver?.knownDevices ?? [
-    { vendorId: DONGLE_VENDOR_ID, productId: 0x1520 },
-    { vendorId: DONGLE_VENDOR_ID, productId: 0x1521 }
-  ]
+  const filters = getDongleFilters()
   const startedAt = Date.now()
 
   while (!stopping) {
+    const requestTimeoutMs =
+      timeoutMs > 0 ? Math.max(1, Math.min(USB_REQUEST_DEVICE_TIMEOUT_MS, timeoutMs - (Date.now() - startedAt))) : USB_REQUEST_DEVICE_TIMEOUT_MS
+
     try {
-      const device = await usbModule.webusb.requestDevice({ filters })
+      const device = await Promise.race([
+        usbModule.webusb.requestDevice({ filters }),
+        delay(requestTimeoutMs).then(() => null)
+      ])
       if (device) return device
-    } catch {
-      // requestDevice throws while the dongle is absent during reset/re-enumeration.
+      log('usbRequestDeviceTimedOut', {
+        requestTimeoutMs,
+        elapsedMs: Date.now() - startedAt,
+        filters: formatFilters(filters)
+      })
+    } catch (error) {
+      log('usbRequestDeviceFailed', {
+        requestTimeoutMs,
+        elapsedMs: Date.now() - startedAt,
+        filters: formatFilters(filters),
+        error: getErrorMessage(error)
+      })
     }
 
     if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) {
@@ -975,6 +1010,72 @@ const requestWebUsbDongle = async ({ timeoutMs = 0 } = {}) => {
     await delay(DONGLE_POLL_INTERVAL_MS)
   }
 
+  return null
+}
+
+const wrapLegacyDongleAsWebUsb = async (legacyDevice) => {
+  const createInstance = usbModule.WebUSBDevice?.createInstance
+  if (typeof createInstance !== 'function' || !legacyDevice) {
+    return null
+  }
+  return createInstance(legacyDevice)
+}
+
+const acquireWebUsbDongle = async ({ legacyDevice = null, timeoutMs = 0, purpose = 'startup' } = {}) => {
+  const filters = getDongleFilters()
+  log('usbAcquireStarted', {
+    purpose,
+    timeoutMs: timeoutMs || undefined,
+    filters: formatFilters(filters),
+    knownDongles: listMatchingDongles().map(formatDevice),
+    preferredLegacyDevice: formatDevice(legacyDevice)
+  })
+
+  if (legacyDevice) {
+    try {
+      const wrappedDevice = await wrapLegacyDongleAsWebUsb(legacyDevice)
+      if (wrappedDevice) {
+        log('usbAcquireSucceeded', {
+          purpose,
+          method: 'legacy-wrap',
+          ...formatWebUsbDevice(wrappedDevice),
+          legacyDevice: formatDevice(legacyDevice)
+        })
+        return wrappedDevice
+      }
+      log('usbAcquireWrapUnavailable', {
+        purpose,
+        diagnostic: 'usb.WebUSBDevice.createInstance was not available; falling back to usb.webusb.requestDevice().'
+      })
+    } catch (error) {
+      log('usbAcquireWrapFailed', {
+        purpose,
+        error: getErrorMessage(error),
+        legacyDevice: formatDevice(legacyDevice),
+        diagnostic: 'Wrapping the known legacy usb.Device failed; falling back to usb.webusb.requestDevice().'
+      })
+    }
+  }
+
+  const device = await requestWebUsbDongle({ timeoutMs })
+  if (device) {
+    log('usbAcquireSucceeded', {
+      purpose,
+      method: 'requestDevice',
+      ...formatWebUsbDevice(device)
+    })
+    return device
+  }
+
+  log('usbAcquireFailed', {
+    purpose,
+    timeoutMs: timeoutMs || undefined,
+    filters: formatFilters(filters),
+    knownDongles: listMatchingDongles().map(formatDevice),
+    preferredLegacyDevice: formatDevice(legacyDevice),
+    diagnostic:
+      'The dongle is visible through usb.getDeviceList(), but neither usb.WebUSBDevice.createInstance nor usb.webusb.requestDevice() produced a usable WebUSB device.'
+  })
   return null
 }
 
@@ -998,11 +1099,15 @@ const closeWebUsbDevice = async (device, reason) => {
   }
 }
 
-const resetAndReopenDongle = async () => {
-  const resetDevice = await requestWebUsbDongle({ timeoutMs: USB_ACQUIRE_TIMEOUT_MS })
+const resetAndReopenDongle = async (legacyDongle) => {
+  const resetDevice = await acquireWebUsbDongle({
+    legacyDevice: legacyDongle,
+    timeoutMs: USB_ACQUIRE_TIMEOUT_MS,
+    purpose: 'startup-reset'
+  })
   if (!resetDevice) {
     throw new Error(
-      `Dongle was discovered but usb.webusb.requestDevice() did not return a device within ${USB_ACQUIRE_TIMEOUT_MS}ms`
+      `Dongle was discovered but the native runtime could not acquire a usable WebUSB device within ${USB_ACQUIRE_TIMEOUT_MS}ms`
     )
   }
 
@@ -1035,11 +1140,15 @@ const resetAndReopenDongle = async () => {
     throw new Error(`Dongle did not re-enumerate after reset within ${DONGLE_REDISCOVERY_TIMEOUT_MS}ms`)
   }
 
-  const rediscoveredDevice = await requestWebUsbDongle({
-    timeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS
+  const rediscoveredDevice = await acquireWebUsbDongle({
+    legacyDevice: rediscoveredNativeDevice,
+    timeoutMs: DONGLE_REDISCOVERY_TIMEOUT_MS,
+    purpose: 'post-reset-rediscovery'
   })
   if (!rediscoveredDevice) {
-    throw new Error(`Dongle did not become available through usb.webusb after ${DONGLE_REDISCOVERY_TIMEOUT_MS}ms`)
+    throw new Error(
+      `Dongle re-enumerated in usb.getDeviceList(), but the native runtime could not reacquire a usable WebUSB device within ${DONGLE_REDISCOVERY_TIMEOUT_MS}ms`
+    )
   }
 
   await rediscoveredDevice.open()
@@ -1158,9 +1267,9 @@ const createRuntime = () => {
   }
 }
 
-const startPatchedRuntime = async () => {
+const startPatchedRuntime = async (legacyDongle) => {
   createRuntime()
-  const device = await resetAndReopenDongle()
+  const device = await resetAndReopenDongle(legacyDongle)
   const runtimeConfig = carplay._config ?? config
   await carplay.dongleDriver.initialise(device)
   await carplay.dongleDriver.start(runtimeConfig)
@@ -1213,12 +1322,12 @@ const startSession = async () => {
       }
 
       try {
-        await waitForDongle()
+        const dongle = await waitForDongle()
         if (stopping) return status
         setSession('starting', {
           deviceFound: true
         })
-        await startPatchedRuntime()
+        await startPatchedRuntime(dongle)
         return status
       } catch (error) {
         await cleanupNativeRuntime({ reason: 'failed start', emitStopped: false })
