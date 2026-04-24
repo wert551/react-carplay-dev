@@ -23,6 +23,7 @@ const USB_RESET_SETTLE_MS = Number(process.env.CARPLAY_NATIVE_RESET_SETTLE_MS ??
 const WIFI_PAIR_DELAY_MS = Number(process.env.CARPLAY_NATIVE_WIFI_PAIR_DELAY_MS ?? 15000)
 const USB_STOP_RESET_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_STOP_RESET_TIMEOUT_MS ?? 2500)
 const USB_CLOSE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_CLOSE_TIMEOUT_MS ?? 1000)
+const USB_ACQUIRE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_ACQUIRE_TIMEOUT_MS ?? 15000)
 const AUTO_START = process.env.CARPLAY_NATIVE_AUTOSTART === '1'
 const H264_NAL_TYPES = {
   IDR: 5,
@@ -998,8 +999,12 @@ const closeWebUsbDevice = async (device, reason) => {
 }
 
 const resetAndReopenDongle = async () => {
-  const resetDevice = await requestWebUsbDongle()
-  if (!resetDevice) throw new Error('Unable to acquire dongle before reset')
+  const resetDevice = await requestWebUsbDongle({ timeoutMs: USB_ACQUIRE_TIMEOUT_MS })
+  if (!resetDevice) {
+    throw new Error(
+      `Dongle was discovered but usb.webusb.requestDevice() did not return a device within ${USB_ACQUIRE_TIMEOUT_MS}ms`
+    )
+  }
 
   log('resetStarted', {
     mode: 'patched',
@@ -1210,6 +1215,9 @@ const startSession = async () => {
       try {
         await waitForDongle()
         if (stopping) return status
+        setSession('starting', {
+          deviceFound: true
+        })
         await startPatchedRuntime()
         return status
       } catch (error) {
