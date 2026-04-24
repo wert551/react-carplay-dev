@@ -1173,6 +1173,13 @@ const startPatchedRuntime = async () => {
     ...getConfiguredVideoConfig(runtimeConfig)
   })
   scheduleWifiPair(runtimeConfig)
+
+  if (!stopping && status.session !== 'connected' && status.session !== 'error') {
+    log('waitingForPhone')
+    setSession('waiting_for_phone', {
+      deviceFound: true
+    })
+  }
 }
 
 const startSession = async () => {
@@ -1203,8 +1210,6 @@ const startSession = async () => {
       try {
         await waitForDongle()
         if (stopping) return status
-        log('waitingForPhone')
-        setSession('waiting_for_phone')
         await startPatchedRuntime()
         return status
       } catch (error) {
