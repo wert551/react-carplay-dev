@@ -34,6 +34,9 @@ const USB_REQUEST_DEVICE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_REQUEST_
 const AUTO_START = process.env.CARPLAY_NATIVE_AUTOSTART === '1'
 const AUDIO_BACKPRESSURE_SEVERE_BYTES = Number(process.env.CARPLAY_NATIVE_AUDIO_BACKPRESSURE_SEVERE_BYTES ?? 4194304)
 const VIDEO_BACKPRESSURE_DROP_BYTES = Number(process.env.CARPLAY_NATIVE_VIDEO_BACKPRESSURE_DROP_BYTES ?? 524288)
+const VIDEO_STALL_MS = Number(process.env.CARPLAY_VIDEO_STALL_MS ?? 6000)
+const AUDIO_STALL_MS = Number(process.env.CARPLAY_AUDIO_STALL_MS ?? 3000)
+const AUTO_RECOVER_STALLS = process.env.CARPLAY_AUTO_RECOVER_STALLS === '1' || process.env.CARPLAY_AUTO_RECOVER_STALLS === 'true'
 const HOT_PATH_RUNTIME_MESSAGE_INTERVAL_MS = 2000
 const H264_NAL_TYPES = {
   NON_IDR: 1,
@@ -74,6 +77,7 @@ let audioStreamServer = null
 let perfStatsTimer = null
 let stopping = false
 let videoFrameSequence = 0
+let recoveryPromise = null
 let lastAudioRuntimeMessageAt = 0
 let lastVideoRuntimeMessageAt = 0
 let lastMediaRuntimeMessageAt = 0
@@ -159,6 +163,12 @@ const streamStats = {
   videoDroppedDeltaFrames: 0,
   videoDroppedKeyframes: 0,
   videoWriteErrors: 0,
+  mediaMessages: 0,
+  lastAudioPacketAt: 0,
+  lastVideoPacketAt: 0,
+  lastMediaMessageAt: 0,
+  consecutiveVideoStallIntervals: 0,
+  consecutiveAudioStallIntervals: 0,
   lastAudioPackets: 0,
   lastAudioBytesForwarded: 0,
   lastAudioDroppedClients: 0,
@@ -169,7 +179,8 @@ const streamStats = {
   lastVideoDroppedFrames: 0,
   lastVideoDroppedDeltaFrames: 0,
   lastVideoDroppedKeyframes: 0,
-  lastVideoWriteErrors: 0
+  lastVideoWriteErrors: 0,
+  lastMediaMessages: 0
 }
 
 const now = () => new Date().toISOString()
@@ -291,6 +302,16 @@ const shouldEmitLowRateRuntimeMessage = (type) => {
   return true
 }
 
+const packetAgeMs = (timestamp, nowMs = Date.now()) => (timestamp > 0 ? nowMs - timestamp : null)
+
+const resetStreamStallDiagnostics = () => {
+  streamStats.lastAudioPacketAt = 0
+  streamStats.lastVideoPacketAt = 0
+  streamStats.lastMediaMessageAt = 0
+  streamStats.consecutiveVideoStallIntervals = 0
+  streamStats.consecutiveAudioStallIntervals = 0
+}
+
 const writeStreamStats = () => {
   const audioPackets = streamStats.audioPackets - streamStats.lastAudioPackets
   const audioBytesForwarded = streamStats.audioBytesForwarded - streamStats.lastAudioBytesForwarded
@@ -305,6 +326,28 @@ const writeStreamStats = () => {
   const videoDroppedDeltaFrames = streamStats.videoDroppedDeltaFrames - streamStats.lastVideoDroppedDeltaFrames
   const videoDroppedKeyframes = streamStats.videoDroppedKeyframes - streamStats.lastVideoDroppedKeyframes
   const videoWriteErrors = streamStats.videoWriteErrors - streamStats.lastVideoWriteErrors
+  const mediaMessages = streamStats.mediaMessages - streamStats.lastMediaMessages
+  const nowMs = Date.now()
+  const lastAudioPacketAgeMs = packetAgeMs(streamStats.lastAudioPacketAt, nowMs)
+  const lastVideoPacketAgeMs = packetAgeMs(streamStats.lastVideoPacketAt, nowMs)
+  const lastMediaMessageAgeMs = packetAgeMs(streamStats.lastMediaMessageAt, nowMs)
+  const connected = status.session === 'connected'
+  const audioOrMediaStillFlowing =
+    audioPackets > 0 ||
+    mediaMessages > 0 ||
+    (lastAudioPacketAgeMs != null && lastAudioPacketAgeMs <= VIDEO_STALL_MS) ||
+    (lastMediaMessageAgeMs != null && lastMediaMessageAgeMs <= VIDEO_STALL_MS)
+  const videoStalled =
+    connected &&
+    streamStats.lastVideoPacketAt > 0 &&
+    lastVideoPacketAgeMs != null &&
+    lastVideoPacketAgeMs > VIDEO_STALL_MS &&
+    audioOrMediaStillFlowing
+  const audioStalled =
+    connected &&
+    streamStats.lastAudioPacketAt > 0 &&
+    lastAudioPacketAgeMs != null &&
+    lastAudioPacketAgeMs > AUDIO_STALL_MS
 
   streamStats.lastAudioPackets = streamStats.audioPackets
   streamStats.lastAudioBytesForwarded = streamStats.audioBytesForwarded
@@ -319,6 +362,57 @@ const writeStreamStats = () => {
   streamStats.lastVideoDroppedDeltaFrames = streamStats.videoDroppedDeltaFrames
   streamStats.lastVideoDroppedKeyframes = streamStats.videoDroppedKeyframes
   streamStats.lastVideoWriteErrors = streamStats.videoWriteErrors
+  streamStats.lastMediaMessages = streamStats.mediaMessages
+
+  if (videoStalled) {
+    streamStats.consecutiveVideoStallIntervals += 1
+    if (streamStats.consecutiveVideoStallIntervals === 1) {
+      log('videoStallDetected', {
+        thresholdMs: VIDEO_STALL_MS,
+        lastVideoPacketAgeMs,
+        lastAudioPacketAgeMs,
+        lastMediaMessageAgeMs,
+        audioPackets,
+        mediaMessages,
+        autoRecover: AUTO_RECOVER_STALLS
+      })
+      requestSoftVideoRefresh('videoStallDetected').catch((error) => {
+        log('softVideoRefreshError', {
+          reason: 'videoStallDetected',
+          error: getErrorMessage(error),
+          stack: getErrorStack(error)
+        })
+      })
+      if (AUTO_RECOVER_STALLS) {
+        recoverSession({ source: 'videoStallDetected', automatic: true }).catch((error) => {
+          log('sessionRecoveryFailed', {
+            source: 'videoStallDetected',
+            automatic: true,
+            error: getErrorMessage(error),
+            stack: getErrorStack(error)
+          })
+        })
+      }
+    }
+  } else {
+    streamStats.consecutiveVideoStallIntervals = 0
+  }
+
+  if (audioStalled) {
+    streamStats.consecutiveAudioStallIntervals += 1
+    if (streamStats.consecutiveAudioStallIntervals === 1) {
+      log('audioStallDetected', {
+        thresholdMs: AUDIO_STALL_MS,
+        lastAudioPacketAgeMs,
+        lastVideoPacketAgeMs,
+        lastMediaMessageAgeMs,
+        videoPackets,
+        mediaMessages
+      })
+    }
+  } else {
+    streamStats.consecutiveAudioStallIntervals = 0
+  }
 
   debugLog('streamPerformanceStats', {
     intervalMs: PERF_STATS_INTERVAL_MS,
@@ -337,6 +431,18 @@ const writeStreamStats = () => {
     videoDroppedKeyframes,
     videoDroppedClients,
     videoWriteErrors,
+    mediaMessages,
+    lastAudioPacketAt: streamStats.lastAudioPacketAt,
+    lastVideoPacketAt: streamStats.lastVideoPacketAt,
+    lastMediaMessageAt: streamStats.lastMediaMessageAt,
+    lastAudioPacketAgeMs,
+    lastVideoPacketAgeMs,
+    lastMediaMessageAgeMs,
+    consecutiveVideoStallIntervals: streamStats.consecutiveVideoStallIntervals,
+    consecutiveAudioStallIntervals: streamStats.consecutiveAudioStallIntervals,
+    videoStallThresholdMs: VIDEO_STALL_MS,
+    audioStallThresholdMs: AUDIO_STALL_MS,
+    autoRecoverStalls: AUTO_RECOVER_STALLS,
     videoMessagesReceived: videoDiagnostics.videoMessagesReceived,
     videoBytesReceived: videoDiagnostics.videoBytesReceived,
     videoSpsCount: videoDiagnostics.spsCount,
@@ -1076,6 +1182,7 @@ const broadcastAudioPacket = (audioMessage) => {
   if (payload.byteLength === 0) return
 
   streamStats.audioPackets += 1
+  streamStats.lastAudioPacketAt = Date.now()
 
   if (audioStreamClients.size === 0) return
 
@@ -1126,6 +1233,7 @@ const broadcastVideoAccessUnit = (videoInfo) => {
   videoDiagnostics.lastSequence = videoFrameSequence
   videoDiagnostics.lastPtsUs = Number(pts <= BigInt(Number.MAX_SAFE_INTEGER) ? pts : BigInt(Number.MAX_SAFE_INTEGER))
   streamStats.videoPackets += 1
+  streamStats.lastVideoPacketAt = Date.now()
 
   if (videoStreamClients.size === 0) return
 
@@ -1798,6 +1906,8 @@ const attachMessageHandler = () => {
         }
         break
       case 'media':
+        streamStats.mediaMessages += 1
+        streamStats.lastMediaMessageAt = Date.now()
         if (shouldEmitLowRateRuntimeMessage(type)) {
           const summary = summarize(message?.message)
           emitRuntimeMessage({ type, message: summary })
@@ -1896,6 +2006,7 @@ const startSession = async () => {
       pendingVideoConfig: getConfiguredVideoConfig(config),
       pendingResolution: getConfiguredResolution(config)
     })
+    resetStreamStallDiagnostics()
     resetVideoDiagnostics()
 
     for (let attempt = 0; attempt <= START_RETRY_LIMIT && !stopping; attempt += 1) {
@@ -2018,6 +2129,7 @@ const stopSession = async () => {
       activeResolution: null
     })
     resetVideoDiagnostics()
+    resetStreamStallDiagnostics()
     return status
   })().finally(() => {
     stopPromise = null
@@ -2042,6 +2154,91 @@ const getNativeExport = (...names) => {
     if (candidate != null) return candidate
   }
   return null
+}
+
+async function requestSoftVideoRefresh(reason = 'manual') {
+  const SendCommand = getNativeExport('SendCommand')
+  if (status.session !== 'connected' || !carplay?.dongleDriver || typeof carplay.dongleDriver.send !== 'function') {
+    const result = {
+      ok: false,
+      action: 'softVideoRefresh',
+      reason,
+      diagnostic: 'CarPlay runtime is not connected; soft frame refresh is unavailable.'
+    }
+    log('softVideoRefreshUnavailable', result)
+    return result
+  }
+  if (typeof SendCommand !== 'function') {
+    const result = {
+      ok: false,
+      action: 'softVideoRefresh',
+      reason,
+      diagnostic: 'node-carplay/node does not expose SendCommand; hard USB/session recovery may be required.'
+    }
+    log('softVideoRefreshUnavailable', result)
+    return result
+  }
+
+  const sent = await carplay.dongleDriver.send(new SendCommand('frame'))
+  const result = {
+    ok: Boolean(sent),
+    action: 'softVideoRefresh',
+    command: 'frame',
+    reason,
+    sent: Boolean(sent),
+    diagnostic: sent
+      ? 'Requested a fresh CarPlay video frame without restarting the session.'
+      : 'Dongle rejected the soft frame refresh; hard USB/session recovery may be required.'
+  }
+  log(sent ? 'softVideoRefreshRequested' : 'softVideoRefreshUnavailable', result)
+  return result
+}
+
+async function recoverSession({ source = 'manual', automatic = false } = {}) {
+  if (recoveryPromise) return recoveryPromise
+
+  recoveryPromise = (async () => {
+    log('sessionRecoveryRequested', {
+      source,
+      automatic,
+      action: 'restartSession',
+      diagnostic: 'Attempting stop+start recovery inside the existing Node runtime process.'
+    })
+
+    if (typeof restartSession !== 'function') {
+      const result = {
+        ok: false,
+        action: 'none',
+        source,
+        automatic,
+        diagnostic: 'No safe in-process restart is available; hard USB reset is required.'
+      }
+      log('sessionRecoveryUnavailable', result)
+      return result
+    }
+
+    const recoveredStatus = await restartSession()
+    resetStreamStallDiagnostics()
+    const result = {
+      ok: true,
+      action: 'restartSession',
+      source,
+      automatic,
+      status: recoveredStatus
+    }
+    log('sessionRecoveryCompleted', {
+      source,
+      automatic,
+      action: result.action,
+      session: recoveredStatus.session,
+      desiredSession: recoveredStatus.desiredSession
+    })
+    return result
+  })().finally(() => {
+    recoveryPromise = null
+  })
+
+  return recoveryPromise
 }
 
 const assertInputRuntimeReady = () => {
@@ -2224,6 +2421,11 @@ const handleHttpRequest = async (request, response) => {
     return
   }
 
+  if (method === 'POST' && url.pathname === '/session/recover') {
+    await handleHttpOperation(response, () => recoverSession({ source: 'http' }))
+    return
+  }
+
   if (method === 'POST' && url.pathname === '/camera') {
     await handleHttpOperation(response, async () => {
       const body = await readJsonBody(request)
@@ -2265,6 +2467,7 @@ const handleHttpRequest = async (request, response) => {
       'POST /start',
       'POST /stop',
       'POST /restart',
+      'POST /session/recover',
       'POST /camera',
       'POST /input/touch',
       'POST /input/key',
@@ -2330,6 +2533,7 @@ const registerSocketApi = () => {
     socket.on('startSession', (callback) => reply(startSession, callback))
     socket.on('stopSession', (callback) => reply(stopSession, callback))
     socket.on('restartSession', (callback) => reply(restartSession, callback))
+    socket.on('recoverSession', (callback) => reply(() => recoverSession({ source: 'socket' }), callback))
     socket.on('showCamera', (visible, callback) => reply(() => showCamera(visible), callback))
   })
 }
