@@ -32,11 +32,15 @@ const USB_CLOSE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_CLOSE_TIMEOUT_MS 
 const USB_ACQUIRE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_ACQUIRE_TIMEOUT_MS ?? 15000)
 const USB_REQUEST_DEVICE_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_REQUEST_DEVICE_TIMEOUT_MS ?? 3000)
 const AUTO_START = process.env.CARPLAY_NATIVE_AUTOSTART === '1'
+const AUDIO_BACKPRESSURE_SEVERE_BYTES = Number(process.env.CARPLAY_NATIVE_AUDIO_BACKPRESSURE_SEVERE_BYTES ?? 4194304)
+const VIDEO_BACKPRESSURE_DROP_BYTES = Number(process.env.CARPLAY_NATIVE_VIDEO_BACKPRESSURE_DROP_BYTES ?? 524288)
+const HOT_PATH_RUNTIME_MESSAGE_INTERVAL_MS = 2000
 const H264_NAL_TYPES = {
   IDR: 5,
   SPS: 7,
   PPS: 8
 }
+const H264_LENGTH_PREFIX_SIZES = [4, 3, 2, 1]
 const TOUCH_ACTION_NAMES = new Set(['down', 'move', 'up'])
 const KEY_COMMANDS = new Set([
   'home',
@@ -67,6 +71,9 @@ let audioStreamServer = null
 let perfStatsTimer = null
 let stopping = false
 let videoFrameSequence = 0
+let lastAudioRuntimeMessageAt = 0
+let lastVideoRuntimeMessageAt = 0
+let lastMediaRuntimeMessageAt = 0
 
 const status = {
   desiredSession: 'stopped',
@@ -128,10 +135,15 @@ const streamStats = {
   audioPackets: 0,
   audioBytesForwarded: 0,
   audioDroppedClients: 0,
+  audioMaxWritableLength: 0,
   audioWriteErrors: 0,
   videoPackets: 0,
   videoBytesForwarded: 0,
   videoDroppedClients: 0,
+  videoMaxWritableLength: 0,
+  videoDroppedFrames: 0,
+  videoDroppedDeltaFrames: 0,
+  videoDroppedKeyframes: 0,
   videoWriteErrors: 0,
   lastAudioPackets: 0,
   lastAudioBytesForwarded: 0,
@@ -140,6 +152,9 @@ const streamStats = {
   lastVideoPackets: 0,
   lastVideoBytesForwarded: 0,
   lastVideoDroppedClients: 0,
+  lastVideoDroppedFrames: 0,
+  lastVideoDroppedDeltaFrames: 0,
+  lastVideoDroppedKeyframes: 0,
   lastVideoWriteErrors: 0
 }
 
@@ -230,23 +245,65 @@ const shouldDebugNativeMessage = (type) => {
   return true
 }
 
+const updateMaxWritableLength = (type, socket) => {
+  const writableLength = socket?.writableLength ?? 0
+  if (type === 'audio') {
+    if (writableLength > streamStats.audioMaxWritableLength) {
+      streamStats.audioMaxWritableLength = writableLength
+    }
+  } else if (writableLength > streamStats.videoMaxWritableLength) {
+    streamStats.videoMaxWritableLength = writableLength
+  }
+  return writableLength
+}
+
+const shouldEmitLowRateRuntimeMessage = (type) => {
+  const current = Date.now()
+  if (type === 'audio') {
+    if (current - lastAudioRuntimeMessageAt < HOT_PATH_RUNTIME_MESSAGE_INTERVAL_MS) return false
+    lastAudioRuntimeMessageAt = current
+    return true
+  }
+  if (type === 'video') {
+    if (current - lastVideoRuntimeMessageAt < HOT_PATH_RUNTIME_MESSAGE_INTERVAL_MS) return false
+    lastVideoRuntimeMessageAt = current
+    return true
+  }
+  if (type === 'media') {
+    if (current - lastMediaRuntimeMessageAt < HOT_PATH_RUNTIME_MESSAGE_INTERVAL_MS) return false
+    lastMediaRuntimeMessageAt = current
+    return true
+  }
+  return true
+}
+
 const writeStreamStats = () => {
   const audioPackets = streamStats.audioPackets - streamStats.lastAudioPackets
   const audioBytesForwarded = streamStats.audioBytesForwarded - streamStats.lastAudioBytesForwarded
   const audioDroppedClients = streamStats.audioDroppedClients - streamStats.lastAudioDroppedClients
+  const audioMaxWritableLength = streamStats.audioMaxWritableLength
   const audioWriteErrors = streamStats.audioWriteErrors - streamStats.lastAudioWriteErrors
   const videoPackets = streamStats.videoPackets - streamStats.lastVideoPackets
   const videoBytesForwarded = streamStats.videoBytesForwarded - streamStats.lastVideoBytesForwarded
   const videoDroppedClients = streamStats.videoDroppedClients - streamStats.lastVideoDroppedClients
+  const videoMaxWritableLength = streamStats.videoMaxWritableLength
+  const videoDroppedFrames = streamStats.videoDroppedFrames - streamStats.lastVideoDroppedFrames
+  const videoDroppedDeltaFrames = streamStats.videoDroppedDeltaFrames - streamStats.lastVideoDroppedDeltaFrames
+  const videoDroppedKeyframes = streamStats.videoDroppedKeyframes - streamStats.lastVideoDroppedKeyframes
   const videoWriteErrors = streamStats.videoWriteErrors - streamStats.lastVideoWriteErrors
 
   streamStats.lastAudioPackets = streamStats.audioPackets
   streamStats.lastAudioBytesForwarded = streamStats.audioBytesForwarded
   streamStats.lastAudioDroppedClients = streamStats.audioDroppedClients
+  streamStats.audioMaxWritableLength = 0
   streamStats.lastAudioWriteErrors = streamStats.audioWriteErrors
   streamStats.lastVideoPackets = streamStats.videoPackets
   streamStats.lastVideoBytesForwarded = streamStats.videoBytesForwarded
   streamStats.lastVideoDroppedClients = streamStats.videoDroppedClients
+  streamStats.videoMaxWritableLength = 0
+  streamStats.lastVideoDroppedFrames = streamStats.videoDroppedFrames
+  streamStats.lastVideoDroppedDeltaFrames = streamStats.videoDroppedDeltaFrames
+  streamStats.lastVideoDroppedKeyframes = streamStats.videoDroppedKeyframes
   streamStats.lastVideoWriteErrors = streamStats.videoWriteErrors
 
   debugLog('streamPerformanceStats', {
@@ -254,11 +311,16 @@ const writeStreamStats = () => {
     audioPackets,
     audioBytesForwarded,
     audioClients: audioStreamClients.size,
+    audioMaxWritableLength,
     audioDroppedClients,
     audioWriteErrors,
     videoPackets,
     videoBytesForwarded,
     videoClients: videoStreamClients.size,
+    videoMaxWritableLength,
+    videoDroppedFrames,
+    videoDroppedDeltaFrames,
+    videoDroppedKeyframes,
     videoDroppedClients,
     videoWriteErrors
   })
@@ -497,28 +559,29 @@ const findAnnexBStartCode = (data, offset) => {
   return null
 }
 
-const extractAnnexBNalus = (data) => {
-  const nalus = []
+const inspectAnnexBNalus = (data, onNalu) => {
   let start = findAnnexBStartCode(data, 0)
   if (!start) return null
 
+  let count = 0
   while (start) {
     const payloadStart = start.index + start.length
     const next = findAnnexBStartCode(data, payloadStart)
     const payloadEnd = next ? next.index : data.length
     if (payloadEnd > payloadStart) {
-      nalus.push(data.subarray(payloadStart, payloadEnd))
+      count += 1
+      onNalu(data.subarray(payloadStart, payloadEnd))
     }
     start = next
   }
 
-  return nalus.length > 0 ? nalus : null
+  return count > 0 ? 'h264-annexb' : null
 }
 
-const extractLengthPrefixedNalus = (data) => {
-  for (const prefixLength of [4, 3, 2, 1]) {
-    const nalus = []
+const inspectLengthPrefixedNalus = (data, onNalu) => {
+  for (const prefixLength of H264_LENGTH_PREFIX_SIZES) {
     let offset = 0
+    let count = 0
 
     while (offset + prefixLength <= data.length) {
       let length = 0
@@ -528,34 +591,41 @@ const extractLengthPrefixedNalus = (data) => {
 
       offset += prefixLength
       if (length <= 0 || offset + length > data.length) {
-        nalus.length = 0
+        count = 0
         break
       }
 
-      nalus.push(data.subarray(offset, offset + length))
       offset += length
+      count += 1
     }
 
-    if (nalus.length > 0 && offset === data.length) {
-      return { nalus, format: `h264-length-prefixed-${prefixLength}` }
+    if (count > 0 && offset === data.length) {
+      offset = 0
+      while (offset + prefixLength <= data.length) {
+        let length = 0
+        for (let i = 0; i < prefixLength; i += 1) {
+          length = (length << 8) | data[offset + i]
+        }
+        offset += prefixLength
+        onNalu(data.subarray(offset, offset + length))
+        offset += length
+      }
+      return `h264-length-prefixed-${prefixLength}`
     }
   }
 
   return null
 }
 
-const extractH264Nalus = (data) => {
-  const annexBNalus = extractAnnexBNalus(data)
-  if (annexBNalus) {
-    return { nalus: annexBNalus, format: 'h264-annexb' }
-  }
+const inspectH264Nalus = (data, onNalu) => {
+  const annexBFormat = inspectAnnexBNalus(data, onNalu)
+  if (annexBFormat) return annexBFormat
 
-  const lengthPrefixed = extractLengthPrefixedNalus(data)
-  if (lengthPrefixed) {
-    return lengthPrefixed
-  }
+  const lengthPrefixedFormat = inspectLengthPrefixedNalus(data, onNalu)
+  if (lengthPrefixedFormat) return lengthPrefixedFormat
 
-  return { nalus: [data], format: 'h264-unknown' }
+  onNalu(data)
+  return 'h264-unknown'
 }
 
 class BitReader {
@@ -795,19 +865,21 @@ const updateVideoDiagnostics = (message) => {
   }
 
   videoDiagnostics.lastPayloadBytes = data.byteLength
-  const { nalus, format } = extractH264Nalus(data)
-  videoDiagnostics.format = format
   const nalTypes = []
+  let hasKeyframe = false
+  let hasConfig = false
 
-  for (const nalu of nalus) {
-    if (nalu.byteLength === 0) continue
+  videoDiagnostics.format = inspectH264Nalus(data, (nalu) => {
+    if (nalu.byteLength === 0) return
     const nalType = nalu[0] & 0x1f
-    nalTypes.push(nalType)
+    if (nalTypes.length < 12) nalTypes.push(nalType)
 
     if (nalType === H264_NAL_TYPES.IDR) {
       videoDiagnostics.keyframeCount += 1
+      hasKeyframe = true
     } else if (nalType === H264_NAL_TYPES.SPS) {
       videoDiagnostics.hasSps = true
+      hasConfig = true
       const info = parseSpsInfo(nalu)
       if (info) {
         videoDiagnostics.width = info.width
@@ -816,15 +888,16 @@ const updateVideoDiagnostics = (message) => {
       }
     } else if (nalType === H264_NAL_TYPES.PPS) {
       videoDiagnostics.hasPps = true
+      hasConfig = true
     }
-  }
+  })
 
-  videoDiagnostics.lastNalTypes = nalTypes.slice(0, 12)
+  videoDiagnostics.lastNalTypes = nalTypes
   return {
     data,
     nalTypes,
-    hasKeyframe: nalTypes.includes(H264_NAL_TYPES.IDR),
-    hasConfig: nalTypes.includes(H264_NAL_TYPES.SPS) || nalTypes.includes(H264_NAL_TYPES.PPS),
+    hasKeyframe,
+    hasConfig,
     observedAt
   }
 }
@@ -836,20 +909,22 @@ const writeVideoPacket = (socket, payload, flags, pts) => {
   header.writeUInt16BE(flags, 6)
   header.writeBigUInt64BE(pts, 8)
   header.writeUInt32BE(payload.byteLength, 16)
-  socket.write(Buffer.concat([header, payload]))
-}
-
-const getAudioFormat = (decodeType) => {
-  const decodeTypeMap = nativeModule?.decodeTypeMap ?? nativeModule?.default?.decodeTypeMap
-  const format = decodeTypeMap?.[decodeType] ?? AUDIO_DECODE_TYPE_MAP[decodeType] ?? {}
-  return {
-    sampleRate: Number(format.frequency) > 0 ? Number(format.frequency) : 44100,
-    channels: Number(format.channel) > 0 ? Number(format.channel) : 2
+  socket.cork?.()
+  try {
+    const headerAccepted = socket.write(header)
+    const payloadAccepted = socket.write(payload)
+    return headerAccepted && payloadAccepted
+  } finally {
+    socket.uncork?.()
   }
 }
 
 const writeAudioPacket = (socket, audioMessage, payload) => {
-  const { sampleRate, channels } = getAudioFormat(audioMessage?.decodeType)
+  const decodeType = audioMessage?.decodeType
+  const decodeTypeMap = nativeModule?.decodeTypeMap ?? nativeModule?.default?.decodeTypeMap
+  const format = decodeTypeMap?.[decodeType] ?? AUDIO_DECODE_TYPE_MAP[decodeType] ?? {}
+  const sampleRate = Number(format.frequency) > 0 ? Number(format.frequency) : 44100
+  const channels = Number(format.channel) > 0 ? Number(format.channel) : 2
   const bytesPerSample = 2
   const frameCount = Math.floor(payload.byteLength / (channels * bytesPerSample))
   const command = Number.isFinite(Number(audioMessage?.command)) ? Number(audioMessage.command) : 0
@@ -863,8 +938,14 @@ const writeAudioPacket = (socket, audioMessage, payload) => {
   header.writeUInt32LE(command >>> 0, 16)
   header.writeUInt32LE(payload.byteLength, 20)
 
-  socket.write(header)
-  socket.write(payload)
+  socket.cork?.()
+  try {
+    const headerAccepted = socket.write(header)
+    const payloadAccepted = socket.write(payload)
+    return headerAccepted && payloadAccepted
+  } finally {
+    socket.uncork?.()
+  }
 }
 
 const broadcastAudioPacket = (audioMessage) => {
@@ -875,21 +956,28 @@ const broadcastAudioPacket = (audioMessage) => {
   if (payload.byteLength === 0) return
 
   streamStats.audioPackets += 1
-  if (AUDIO_DEBUG) {
-    debugLog('audioPacketReceived', {
-      decodeType: audioMessage?.decodeType,
-      audioType: audioMessage?.audioType,
-      command: audioMessage?.command,
-      payloadBytes: payload.byteLength,
-      clients: audioStreamClients.size
-    })
-  }
 
   if (audioStreamClients.size === 0) return
 
   for (const socket of audioStreamClients) {
     try {
-      writeAudioPacket(socket, audioMessage, payload)
+      const queuedBytes = updateMaxWritableLength('audio', socket)
+      if (queuedBytes > AUDIO_BACKPRESSURE_SEVERE_BYTES) {
+        streamStats.audioWriteErrors += 1
+        streamStats.audioDroppedClients += 1
+        debugLog('audioStreamBackpressureDisconnect', {
+          writableLength: queuedBytes,
+          thresholdBytes: AUDIO_BACKPRESSURE_SEVERE_BYTES
+        })
+        audioStreamClients.delete(socket)
+        status.audioBinaryClients = audioStreamClients.size
+        socket.destroy()
+        continue
+      }
+
+      const accepted = writeAudioPacket(socket, audioMessage, payload)
+      socket.__carplayAudioBackpressured = !accepted
+      updateMaxWritableLength('audio', socket)
       streamStats.audioBytesForwarded += payload.byteLength
     } catch (error) {
       streamStats.audioWriteErrors += 1
@@ -913,29 +1001,37 @@ const broadcastVideoAccessUnit = (videoInfo) => {
   const payload = Buffer.from(videoInfo.data.buffer, videoInfo.data.byteOffset, videoInfo.data.byteLength)
   const flags = (videoInfo.hasKeyframe ? 1 : 0) | (videoInfo.hasConfig ? 2 : 0)
   const pts = process.hrtime.bigint() / 1000n
+  const isPriorityFrame = videoInfo.hasKeyframe || videoInfo.hasConfig
   videoFrameSequence += 1
   streamStats.videoPackets += 1
 
-  if (VIDEO_DEBUG) {
-    debugLog('videoPacketReceived', {
-      payloadBytes: payload.byteLength,
-      flags,
-      hasKeyframe: videoInfo.hasKeyframe,
-      hasConfig: videoInfo.hasConfig,
-      nalTypes: videoInfo.nalTypes,
-      clients: videoStreamClients.size
-    })
-  }
-
   if (videoStreamClients.size === 0) return
 
+  let sentToClient = false
   for (const socket of videoStreamClients) {
     try {
-      writeVideoPacket(socket, payload, flags, pts)
+      const queuedBytes = updateMaxWritableLength('video', socket)
+      if (!isPriorityFrame && (socket.__carplayVideoBackpressured || queuedBytes > VIDEO_BACKPRESSURE_DROP_BYTES)) {
+        streamStats.videoDroppedFrames += 1
+        streamStats.videoDroppedDeltaFrames += 1
+        continue
+      }
+
+      const accepted = writeVideoPacket(socket, payload, flags, pts)
+      socket.__carplayVideoBackpressured = !accepted
+      updateMaxWritableLength('video', socket)
       streamStats.videoBytesForwarded += payload.byteLength
+      sentToClient = true
     } catch (error) {
       streamStats.videoWriteErrors += 1
       streamStats.videoDroppedClients += 1
+      if (isPriorityFrame) {
+        streamStats.videoDroppedFrames += 1
+        streamStats.videoDroppedKeyframes += 1
+      } else {
+        streamStats.videoDroppedFrames += 1
+        streamStats.videoDroppedDeltaFrames += 1
+      }
       debugLog('videoStreamWriteError', {
         type: 'videoStreamWriteError',
         error: getErrorMessage(error)
@@ -945,14 +1041,17 @@ const broadcastVideoAccessUnit = (videoInfo) => {
     }
   }
 
-  videoDiagnostics.binaryPacketsSent += 1
-  videoDiagnostics.binaryBytesSent += payload.byteLength
+  if (sentToClient) {
+    videoDiagnostics.binaryPacketsSent += 1
+    videoDiagnostics.binaryBytesSent += payload.byteLength
+  }
   videoDiagnostics.binaryClients = videoStreamClients.size
 }
 
 const startVideoStreamServer = () => {
   videoStreamServer = net.createServer((socket) => {
     socket.setNoDelay(true)
+    socket.__carplayVideoBackpressured = false
     videoStreamClients.add(socket)
     videoDiagnostics.binaryClients = videoStreamClients.size
     log('videoStreamClientConnected', {
@@ -975,6 +1074,10 @@ const startVideoStreamServer = () => {
         error: getErrorMessage(error)
       })
     })
+    socket.on('drain', () => {
+      socket.__carplayVideoBackpressured = false
+      updateMaxWritableLength('video', socket)
+    })
   })
 
   videoStreamServer.on('error', (error) => {
@@ -993,6 +1096,7 @@ const startVideoStreamServer = () => {
 const startAudioStreamServer = () => {
   audioStreamServer = net.createServer((socket) => {
     socket.setNoDelay(true)
+    socket.__carplayAudioBackpressured = false
     audioStreamClients.add(socket)
     setStatus({
       audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
@@ -1017,6 +1121,10 @@ const startAudioStreamServer = () => {
       log('audioStreamClientError', {
         error: getErrorMessage(error)
       })
+    })
+    socket.on('drain', () => {
+      socket.__carplayAudioBackpressured = false
+      updateMaxWritableLength('audio', socket)
     })
   })
 
@@ -1484,7 +1592,7 @@ const attachMessageHandler = () => {
     const type = message?.type ?? 'nativeMessage'
     status.metadata.lastMessageAt = Date.now()
 
-    if (shouldDebugNativeMessage(type)) {
+    if (type !== 'audio' && type !== 'video' && shouldDebugNativeMessage(type)) {
       debugLog('nativeMessageReceived', {
         type,
         wrapperKeys: message && typeof message === 'object' ? Object.keys(message) : [],
@@ -1517,6 +1625,7 @@ const attachMessageHandler = () => {
         })
         break
       case 'video':
+        broadcastVideoAccessUnit(updateVideoDiagnostics(message?.message))
         if (!status.isPlugged) {
           log('phoneConnected', { inferredFrom: 'video' })
           setSession('connected', {
@@ -1524,38 +1633,49 @@ const attachMessageHandler = () => {
             deviceFound: true
           })
         }
-        broadcastVideoAccessUnit(updateVideoDiagnostics(message?.message))
-        setStatus({ receivingVideo: true })
-        emitRuntimeMessage({ type, message: summarize(message?.message) })
+        if (!status.receivingVideo) {
+          setStatus({ receivingVideo: true })
+        }
+        if (VIDEO_DEBUG && shouldEmitLowRateRuntimeMessage(type)) {
+          const summary = summarize(message?.message)
+          debugLog('nativeMessageReceived', {
+            type,
+            wrapperKeys: message && typeof message === 'object' ? Object.keys(message) : [],
+            wrapperClass: message?.constructor?.name,
+            payloadClass: message?.message?.constructor?.name,
+            message: summary
+          })
+          emitRuntimeMessage({ type, message: summary })
+        }
         break
       case 'audio':
-        if (AUDIO_DEBUG) {
-          debugLog('audioDataReceived', {
-            keys: message?.message && typeof message.message === 'object' ? Object.keys(message.message) : [],
-            decodeType: message?.message?.decodeType,
-            audioType: message?.message?.audioType,
-            command: message?.message?.command,
-            volume: message?.message?.volume,
-            volumeDuration: message?.message?.volumeDuration,
-            payloadBytes: getPayloadByteLength(message?.message?.data),
-            dataSummary: summarize(message?.message?.data)
-          })
-        }
         broadcastAudioPacket(message?.message)
-        emitRuntimeMessage({ type, message: summarize(message?.message) })
         if (AUDIO_DEBUG) {
-          log('runtimeMessage', {
-            type,
-            message: summarize(message?.message)
-          })
+          if (shouldEmitLowRateRuntimeMessage(type)) {
+            const summary = summarize(message?.message)
+            debugLog('audioDataReceived', {
+              keys: message?.message && typeof message.message === 'object' ? Object.keys(message.message) : [],
+              decodeType: message?.message?.decodeType,
+              audioType: message?.message?.audioType,
+              command: message?.message?.command,
+              volume: message?.message?.volume,
+              volumeDuration: message?.message?.volumeDuration,
+              payloadBytes: getPayloadByteLength(message?.message?.data),
+              message: summary
+            })
+            emitRuntimeMessage({ type, message: summary })
+          }
         }
         break
       case 'media':
-        emitRuntimeMessage({ type, message: summarize(message?.message) })
-        log('runtimeMessage', {
-          type,
-          message: summarize(message?.message)
-        })
+        if (shouldEmitLowRateRuntimeMessage(type)) {
+          const summary = summarize(message?.message)
+          emitRuntimeMessage({ type, message: summary })
+          log('runtimeMessage', {
+            type,
+            message: summary
+          })
+        }
         break
       case 'command':
         if (isRequestHostUiCommand(message?.message)) {
