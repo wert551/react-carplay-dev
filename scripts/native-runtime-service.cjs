@@ -14,8 +14,11 @@ const HOST = process.env.CARPLAY_NATIVE_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.CARPLAY_NATIVE_PORT ?? 4100)
 const VIDEO_STREAM_HOST = process.env.CARPLAY_NATIVE_VIDEO_HOST ?? HOST
 const VIDEO_STREAM_PORT = Number(process.env.CARPLAY_NATIVE_VIDEO_PORT ?? PORT + 1)
+const AUDIO_STREAM_HOST = process.env.CARPLAY_NATIVE_AUDIO_HOST ?? '127.0.0.1'
+const AUDIO_STREAM_PORT = Number(process.env.CARPLAY_NATIVE_AUDIO_PORT ?? 4102)
 const CONFIG_PATH =
   process.env.CARPLAY_NATIVE_CONFIG ?? path.join(os.homedir(), '.config', 'react-carplay', 'config.json')
+const DEBUG_LOG_PATH = process.env.CARPLAY_NATIVE_DEBUG_LOG ?? '/tmp/carplay-native-debug.log'
 const START_RETRY_LIMIT = Number(process.env.CARPLAY_NATIVE_START_RETRIES ?? 2)
 const DONGLE_REDISCOVERY_TIMEOUT_MS = Number(process.env.CARPLAY_NATIVE_REDISCOVERY_TIMEOUT_MS ?? 30000)
 const DONGLE_POLL_INTERVAL_MS = Number(process.env.CARPLAY_NATIVE_POLL_INTERVAL_MS ?? 1000)
@@ -57,6 +60,7 @@ let startPromise = null
 let stopPromise = null
 let httpServer = null
 let videoStreamServer = null
+let audioStreamServer = null
 let stopping = false
 let videoFrameSequence = 0
 
@@ -77,6 +81,8 @@ const status = {
   activeVideoConfig: null,
   pendingVideoConfig: null,
   activeResolution: null,
+  audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
+  audioBinaryClients: 0,
   pendingResolution: null,
   updatedAt: Date.now(),
   metadata: {
@@ -117,6 +123,17 @@ const videoDiagnostics = {
 const now = () => new Date().toISOString()
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+const debugLog = (event, details = {}) => {
+  const payload = { timestamp: now(), event, ...details }
+  try {
+    fs.mkdirSync(path.dirname(DEBUG_LOG_PATH), { recursive: true })
+    fs.appendFileSync(DEBUG_LOG_PATH, `${JSON.stringify(payload)}\n`)
+  } catch (error) {
+    console.error('Failed to write native debug log', error)
+  }
+  return payload
+}
+
 const io = new Server({
   cors: {
     origin: '*'
@@ -124,6 +141,17 @@ const io = new Server({
 })
 const wsClients = new Set()
 const videoStreamClients = new Set()
+const audioStreamClients = new Set()
+
+const AUDIO_DECODE_TYPE_MAP = {
+  1: { frequency: 44100, channel: 2 },
+  2: { frequency: 44100, channel: 2 },
+  3: { frequency: 8000, channel: 1 },
+  4: { frequency: 48000, channel: 2 },
+  5: { frequency: 16000, channel: 1 },
+  6: { frequency: 24000, channel: 1 },
+  7: { frequency: 16000, channel: 2 }
+}
 
 const sendWebSocketFrame = (socket, payload) => {
   if (socket.destroyed) return
@@ -167,6 +195,7 @@ const emitWebSocketEvent = (type, data) => {
 const log = (event, details = {}) => {
   const payload = { timestamp: now(), event, ...details }
   console.log(JSON.stringify(payload))
+  debugLog(event, details)
   io.emit('sessionEvent', payload)
   emitWebSocketEvent('sessionEvent', payload)
   return payload
@@ -250,6 +279,16 @@ const getVideoStreamStatus = () => ({
   totalBytesSent: videoDiagnostics.binaryBytesSent
 })
 
+const getAudioStreamStatus = () => ({
+  audioStreamAvailable: Boolean(audioStreamServer?.listening),
+  audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
+  audioHost: AUDIO_STREAM_HOST,
+  audioPort: AUDIO_STREAM_PORT,
+  audioPacketFormat: 'CPA1',
+  audioPacketHeaderBytes: 24,
+  audioBinaryClients: audioStreamClients.size
+})
+
 const setStatus = (update) => {
   Object.assign(status, update)
   emitStatus()
@@ -317,6 +356,17 @@ const summarize = (value) => {
     )
   }
   return value
+}
+
+const getPayloadByteLength = (value) => {
+  if (value == null) return 0
+  if (typeof value.byteLength === 'number') return value.byteLength
+  if (typeof value.length === 'number') {
+    if (typeof value.BYTES_PER_ELEMENT === 'number') return value.length * value.BYTES_PER_ELEMENT
+    return value.length
+  }
+  if (value.buffer && typeof value.buffer.byteLength === 'number') return value.buffer.byteLength
+  return null
 }
 
 const formatDevice = (dongle) => {
@@ -726,6 +776,58 @@ const writeVideoPacket = (socket, payload, flags, pts) => {
   socket.write(Buffer.concat([header, payload]))
 }
 
+const getAudioFormat = (decodeType) => {
+  const decodeTypeMap = nativeModule?.decodeTypeMap ?? nativeModule?.default?.decodeTypeMap
+  const format = decodeTypeMap?.[decodeType] ?? AUDIO_DECODE_TYPE_MAP[decodeType] ?? {}
+  return {
+    sampleRate: Number(format.frequency) > 0 ? Number(format.frequency) : 44100,
+    channels: Number(format.channel) > 0 ? Number(format.channel) : 2
+  }
+}
+
+const writeAudioPacket = (socket, audioMessage, payload) => {
+  const { sampleRate, channels } = getAudioFormat(audioMessage?.decodeType)
+  const bytesPerSample = 2
+  const frameCount = Math.floor(payload.byteLength / (channels * bytesPerSample))
+  const command = Number.isFinite(Number(audioMessage?.command)) ? Number(audioMessage.command) : 0
+  const header = Buffer.alloc(24)
+
+  header.write('CPA1', 0, 4, 'ascii')
+  header.writeUInt32LE(sampleRate, 4)
+  header.writeUInt16LE(channels, 8)
+  header.writeUInt16LE(bytesPerSample, 10)
+  header.writeUInt32LE(frameCount, 12)
+  header.writeUInt32LE(command >>> 0, 16)
+  header.writeUInt32LE(payload.byteLength, 20)
+
+  socket.write(header)
+  socket.write(payload)
+}
+
+const broadcastAudioPacket = (audioMessage) => {
+  const data = audioMessage?.data
+  if (!data || audioStreamClients.size === 0) return
+
+  const payload = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+  if (payload.byteLength === 0) return
+
+  for (const socket of audioStreamClients) {
+    try {
+      writeAudioPacket(socket, audioMessage, payload)
+    } catch (error) {
+      log('runtimeMessage', {
+        type: 'audioStreamWriteError',
+        error: getErrorMessage(error)
+      })
+      audioStreamClients.delete(socket)
+      status.audioBinaryClients = audioStreamClients.size
+      socket.destroy()
+    }
+  }
+
+  status.audioBinaryClients = audioStreamClients.size
+}
+
 const broadcastVideoAccessUnit = (videoInfo) => {
   if (!videoInfo?.data || videoStreamClients.size === 0) return
 
@@ -792,6 +894,53 @@ const startVideoStreamServer = () => {
   })
 }
 
+const startAudioStreamServer = () => {
+  audioStreamServer = net.createServer((socket) => {
+    socket.setNoDelay(true)
+    audioStreamClients.add(socket)
+    setStatus({
+      audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
+      audioBinaryClients: audioStreamClients.size
+    })
+    log('audioStreamClientConnected', {
+      clients: audioStreamClients.size,
+      remoteAddress: socket.remoteAddress,
+      remotePort: socket.remotePort
+    })
+
+    socket.on('close', () => {
+      audioStreamClients.delete(socket)
+      setStatus({ audioBinaryClients: audioStreamClients.size })
+      log('audioStreamClientDisconnected', {
+        clients: audioStreamClients.size
+      })
+    })
+    socket.on('error', (error) => {
+      audioStreamClients.delete(socket)
+      setStatus({ audioBinaryClients: audioStreamClients.size })
+      log('audioStreamClientError', {
+        error: getErrorMessage(error)
+      })
+    })
+  })
+
+  audioStreamServer.on('error', (error) => {
+    log('sessionError', {
+      source: 'audioStream',
+      error: getErrorMessage(error),
+      diagnostic: `Unable to listen on ${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`
+    })
+  })
+
+  audioStreamServer.listen(AUDIO_STREAM_PORT, AUDIO_STREAM_HOST, () => {
+    setStatus({
+      audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
+      audioBinaryClients: audioStreamClients.size
+    })
+    log('audioStreamListening', getAudioStreamStatus())
+  })
+}
+
 const loadDependencies = () => {
   nativeModule = require('node-carplay/node')
   usbModule = require('usb')
@@ -842,6 +991,12 @@ const loadConfig = () => {
     ...defaults,
     ...diskConfig
   }
+  debugLog('effectiveConfigLoaded', {
+    configPath: CONFIG_PATH,
+    defaultAudioTransferMode: defaults.audioTransferMode,
+    diskAudioTransferMode: hasOwn(diskConfig, 'audioTransferMode') ? diskConfig.audioTransferMode : undefined,
+    effectiveAudioTransferMode: config.audioTransferMode
+  })
   status.pendingVideoConfig = getConfiguredVideoConfig(config)
   status.pendingResolution = getConfiguredResolution(config)
   persistConfig()
@@ -909,6 +1064,11 @@ const setConfig = (update) => {
     ...config,
     ...normalizedUpdate
   }
+  debugLog('effectiveConfigUpdated', {
+    configPath: CONFIG_PATH,
+    updateAudioTransferMode: hasOwn(normalizedUpdate, 'audioTransferMode') ? normalizedUpdate.audioTransferMode : undefined,
+    effectiveAudioTransferMode: config.audioTransferMode
+  })
   const nextVideoConfig = getConfiguredVideoConfig(config)
   const nextResolution = getConfiguredResolution(config)
   const resolutionChanged =
@@ -1186,10 +1346,54 @@ const scheduleWifiPair = (runtimeConfig) => {
   })
 }
 
+const wrapDriverSendDebugLogging = (driver) => {
+  if (!driver || driver.__carplayNativeDebugSendWrapped) return
+
+  const originalSend = driver.send
+  if (typeof originalSend !== 'function') return
+
+  driver.send = async (sendableMessage) => {
+    const commandValue = typeof sendableMessage?.value === 'number' ? sendableMessage.value : null
+    const commandName = commandValue == null ? null : getCommandName(commandValue)
+    const details = {
+      messageClass: sendableMessage?.constructor?.name,
+      commandValue,
+      commandName
+    }
+
+    if (commandName === 'audioTransferOn' || commandName === 'audioTransferOff') {
+      debugLog('audioTransferCommandSending', details)
+    }
+
+    const result = await originalSend(sendableMessage)
+
+    if (commandName === 'audioTransferOn' || commandName === 'audioTransferOff') {
+      debugLog('audioTransferCommandSent', {
+        ...details,
+        result
+      })
+    }
+
+    return result
+  }
+
+  Object.defineProperty(driver, '__carplayNativeDebugSendWrapped', {
+    value: true,
+    enumerable: false
+  })
+}
+
 const attachMessageHandler = () => {
   carplay.onmessage = (message) => {
     const type = message?.type ?? 'nativeMessage'
     status.metadata.lastMessageAt = Date.now()
+
+    debugLog('nativeMessageReceived', {
+      type,
+      wrapperKeys: message && typeof message === 'object' ? Object.keys(message) : [],
+      wrapperClass: message?.constructor?.name,
+      payloadClass: message?.message?.constructor?.name
+    })
 
     if (type in status.messageCounts) {
       status.messageCounts[type] += 1
@@ -1227,6 +1431,23 @@ const attachMessageHandler = () => {
         emitRuntimeMessage({ type, message: summarize(message?.message) })
         break
       case 'audio':
+        debugLog('audioDataReceived', {
+          keys: message?.message && typeof message.message === 'object' ? Object.keys(message.message) : [],
+          decodeType: message?.message?.decodeType,
+          audioType: message?.message?.audioType,
+          command: message?.message?.command,
+          volume: message?.message?.volume,
+          volumeDuration: message?.message?.volumeDuration,
+          payloadBytes: getPayloadByteLength(message?.message?.data),
+          dataSummary: summarize(message?.message?.data)
+        })
+        broadcastAudioPacket(message?.message)
+        emitRuntimeMessage({ type, message: summarize(message?.message) })
+        log('runtimeMessage', {
+          type,
+          message: summarize(message?.message)
+        })
+        break
       case 'media':
         emitRuntimeMessage({ type, message: summarize(message?.message) })
         log('runtimeMessage', {
@@ -1265,12 +1486,21 @@ const createRuntime = () => {
   if (!carplay?.dongleDriver?.initialise || !carplay?.dongleDriver?.start) {
     throw new Error('CarplayNode does not expose dongleDriver.initialise/start')
   }
+  wrapDriverSendDebugLogging(carplay.dongleDriver)
 }
 
 const startPatchedRuntime = async (legacyDongle) => {
   createRuntime()
   const device = await resetAndReopenDongle(legacyDongle)
   const runtimeConfig = carplay._config ?? config
+  debugLog('nativeRuntimeStartConfig', {
+    configRevision: status.configRevision,
+    configuredAudioTransferMode: config?.audioTransferMode,
+    runtimeAudioTransferMode: runtimeConfig?.audioTransferMode,
+    width: runtimeConfig?.width,
+    height: runtimeConfig?.height,
+    fps: runtimeConfig?.fps
+  })
   await carplay.dongleDriver.initialise(device)
   await carplay.dongleDriver.start(runtimeConfig)
   setStatus({
@@ -1762,9 +1992,14 @@ const shutdown = async () => {
     socket.end()
   }
   videoStreamClients.clear()
+  for (const socket of audioStreamClients) {
+    socket.end()
+  }
+  audioStreamClients.clear()
   io.close()
   httpServer?.close()
   videoStreamServer?.close()
+  audioStreamServer?.close()
 }
 
 const main = async () => {
@@ -1781,6 +2016,7 @@ const main = async () => {
   io.attach(httpServer)
   httpServer.listen(PORT, HOST)
   startVideoStreamServer()
+  startAudioStreamServer()
   emitConfig()
   emitStatus()
 
@@ -1791,6 +2027,7 @@ const main = async () => {
     webSocketUrl: `ws://${HOST}:${PORT}/events`,
     socketIoUrl: `http://${HOST}:${PORT}`,
     videoStreamUrl: `tcp://${VIDEO_STREAM_HOST}:${VIDEO_STREAM_PORT}`,
+    audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
     configPath: CONFIG_PATH,
     autoStart: AUTO_START
   })
