@@ -36,9 +36,12 @@ const AUDIO_BACKPRESSURE_SEVERE_BYTES = Number(process.env.CARPLAY_NATIVE_AUDIO_
 const VIDEO_BACKPRESSURE_DROP_BYTES = Number(process.env.CARPLAY_NATIVE_VIDEO_BACKPRESSURE_DROP_BYTES ?? 524288)
 const HOT_PATH_RUNTIME_MESSAGE_INTERVAL_MS = 2000
 const H264_NAL_TYPES = {
+  NON_IDR: 1,
   IDR: 5,
+  SEI: 6,
   SPS: 7,
-  PPS: 8
+  PPS: 8,
+  AUD: 9
 }
 const H264_LENGTH_PREFIX_SIZES = [4, 3, 2, 1]
 const TOUCH_ACTION_NAMES = new Set(['down', 'move', 'up'])
@@ -126,6 +129,17 @@ const videoDiagnostics = {
   hasPps: false,
   lastPayloadBytes: 0,
   lastNalTypes: [],
+  videoMessagesReceived: 0,
+  videoBytesReceived: 0,
+  spsCount: 0,
+  ppsCount: 0,
+  idrCount: 0,
+  deltaCount: 0,
+  unknownNalCount: 0,
+  malformedPayloads: 0,
+  emptyPayloads: 0,
+  lastSequence: 0,
+  lastPtsUs: 0,
   binaryPacketsSent: 0,
   binaryBytesSent: 0,
   binaryClients: 0
@@ -322,7 +336,18 @@ const writeStreamStats = () => {
     videoDroppedDeltaFrames,
     videoDroppedKeyframes,
     videoDroppedClients,
-    videoWriteErrors
+    videoWriteErrors,
+    videoMessagesReceived: videoDiagnostics.videoMessagesReceived,
+    videoBytesReceived: videoDiagnostics.videoBytesReceived,
+    videoSpsCount: videoDiagnostics.spsCount,
+    videoPpsCount: videoDiagnostics.ppsCount,
+    videoIdrCount: videoDiagnostics.idrCount,
+    videoDeltaCount: videoDiagnostics.deltaCount,
+    videoUnknownNalCount: videoDiagnostics.unknownNalCount,
+    videoMalformedPayloads: videoDiagnostics.malformedPayloads,
+    videoEmptyPayloads: videoDiagnostics.emptyPayloads,
+    videoLastSequence: videoDiagnostics.lastSequence,
+    videoLastPtsUs: videoDiagnostics.lastPtsUs
   })
 }
 
@@ -617,9 +642,52 @@ const inspectLengthPrefixedNalus = (data, onNalu) => {
   return null
 }
 
+const inspectAvcConfigRecord = (data, onNalu) => {
+  if (data.length < 7 || data[0] !== 1) return null
+
+  try {
+    let offset = 5
+    const lengthSizeMinusOne = data[offset] & 0x03
+    offset += 1
+    const spsCount = data[offset] & 0x1f
+    offset += 1
+
+    let count = 0
+    for (let i = 0; i < spsCount; i += 1) {
+      if (offset + 2 > data.length) return null
+      const length = (data[offset] << 8) | data[offset + 1]
+      offset += 2
+      if (length <= 0 || offset + length > data.length) return null
+      onNalu(data.subarray(offset, offset + length))
+      offset += length
+      count += 1
+    }
+
+    if (offset >= data.length) return count > 0 ? `h264-avcc-config-${lengthSizeMinusOne + 1}` : null
+    const ppsCount = data[offset]
+    offset += 1
+    for (let i = 0; i < ppsCount; i += 1) {
+      if (offset + 2 > data.length) return null
+      const length = (data[offset] << 8) | data[offset + 1]
+      offset += 2
+      if (length <= 0 || offset + length > data.length) return null
+      onNalu(data.subarray(offset, offset + length))
+      offset += length
+      count += 1
+    }
+
+    return count > 0 && offset === data.length ? `h264-avcc-config-${lengthSizeMinusOne + 1}` : null
+  } catch {
+    return null
+  }
+}
+
 const inspectH264Nalus = (data, onNalu) => {
   const annexBFormat = inspectAnnexBNalus(data, onNalu)
   if (annexBFormat) return annexBFormat
+
+  const avcConfigFormat = inspectAvcConfigRecord(data, onNalu)
+  if (avcConfigFormat) return avcConfigFormat
 
   const lengthPrefixedFormat = inspectLengthPrefixedNalus(data, onNalu)
   if (lengthPrefixedFormat) return lengthPrefixedFormat
@@ -827,10 +895,22 @@ const resetVideoDiagnostics = () => {
     hasPps: false,
     lastPayloadBytes: 0,
     lastNalTypes: [],
+    videoMessagesReceived: 0,
+    videoBytesReceived: 0,
+    spsCount: 0,
+    ppsCount: 0,
+    idrCount: 0,
+    deltaCount: 0,
+    unknownNalCount: 0,
+    malformedPayloads: 0,
+    emptyPayloads: 0,
+    lastSequence: 0,
+    lastPtsUs: 0,
     binaryPacketsSent: videoDiagnostics.binaryPacketsSent,
     binaryBytesSent: videoDiagnostics.binaryBytesSent,
     binaryClients: videoStreamClients.size
   })
+  videoFrameSequence = 0
 }
 
 const getVideoStatus = () => ({
@@ -848,26 +928,49 @@ const getVideoStatus = () => ({
   hasPps: videoDiagnostics.hasPps,
   lastPayloadBytes: videoDiagnostics.lastPayloadBytes,
   lastNalTypes: videoDiagnostics.lastNalTypes,
+  videoMessagesReceived: videoDiagnostics.videoMessagesReceived,
+  videoBytesReceived: videoDiagnostics.videoBytesReceived,
+  spsCount: videoDiagnostics.spsCount,
+  ppsCount: videoDiagnostics.ppsCount,
+  idrCount: videoDiagnostics.idrCount,
+  deltaCount: videoDiagnostics.deltaCount,
+  unknownNalCount: videoDiagnostics.unknownNalCount,
+  malformedPayloads: videoDiagnostics.malformedPayloads,
+  emptyPayloads: videoDiagnostics.emptyPayloads,
+  lastSequence: videoDiagnostics.lastSequence,
+  lastPtsUs: videoDiagnostics.lastPtsUs,
   ...getVideoStreamStatus()
 })
 
 const updateVideoDiagnostics = (message) => {
   const data = toUint8Array(message?.data)
   const observedAt = Date.now()
+  const sequence = videoFrameSequence + 1
 
   videoDiagnostics.totalFrames += 1
+  videoDiagnostics.videoMessagesReceived += 1
   videoDiagnostics.lastFrameAt = observedAt
   videoDiagnostics.streamingActive = true
+  videoDiagnostics.lastSequence = sequence
 
   if (!data) {
     videoDiagnostics.lastPayloadBytes = 0
+    videoDiagnostics.malformedPayloads += 1
     return null
   }
 
   videoDiagnostics.lastPayloadBytes = data.byteLength
+  videoDiagnostics.videoBytesReceived += data.byteLength
+  if (data.byteLength === 0) {
+    videoDiagnostics.emptyPayloads += 1
+    return null
+  }
+
   const nalTypes = []
   let hasKeyframe = false
   let hasConfig = false
+  let hasDelta = false
+  let sawKnownNalu = false
 
   videoDiagnostics.format = inspectH264Nalus(data, (nalu) => {
     if (nalu.byteLength === 0) return
@@ -876,10 +979,18 @@ const updateVideoDiagnostics = (message) => {
 
     if (nalType === H264_NAL_TYPES.IDR) {
       videoDiagnostics.keyframeCount += 1
+      videoDiagnostics.idrCount += 1
       hasKeyframe = true
+      sawKnownNalu = true
+    } else if (nalType === H264_NAL_TYPES.NON_IDR) {
+      videoDiagnostics.deltaCount += 1
+      hasDelta = true
+      sawKnownNalu = true
     } else if (nalType === H264_NAL_TYPES.SPS) {
       videoDiagnostics.hasSps = true
+      videoDiagnostics.spsCount += 1
       hasConfig = true
+      sawKnownNalu = true
       const info = parseSpsInfo(nalu)
       if (info) {
         videoDiagnostics.width = info.width
@@ -888,16 +999,25 @@ const updateVideoDiagnostics = (message) => {
       }
     } else if (nalType === H264_NAL_TYPES.PPS) {
       videoDiagnostics.hasPps = true
+      videoDiagnostics.ppsCount += 1
       hasConfig = true
+      sawKnownNalu = true
+    } else if (nalType === H264_NAL_TYPES.SEI || nalType === H264_NAL_TYPES.AUD) {
+      sawKnownNalu = true
+    } else {
+      videoDiagnostics.unknownNalCount += 1
     }
   })
 
+  if (!sawKnownNalu) videoDiagnostics.malformedPayloads += 1
   videoDiagnostics.lastNalTypes = nalTypes
   return {
     data,
     nalTypes,
     hasKeyframe,
     hasConfig,
+    hasDelta,
+    sequence,
     observedAt
   }
 }
@@ -1003,6 +1123,8 @@ const broadcastVideoAccessUnit = (videoInfo) => {
   const pts = process.hrtime.bigint() / 1000n
   const isPriorityFrame = videoInfo.hasKeyframe || videoInfo.hasConfig
   videoFrameSequence += 1
+  videoDiagnostics.lastSequence = videoFrameSequence
+  videoDiagnostics.lastPtsUs = Number(pts <= BigInt(Number.MAX_SAFE_INTEGER) ? pts : BigInt(Number.MAX_SAFE_INTEGER))
   streamStats.videoPackets += 1
 
   if (videoStreamClients.size === 0) return
@@ -1014,6 +1136,14 @@ const broadcastVideoAccessUnit = (videoInfo) => {
       if (!isPriorityFrame && (socket.__carplayVideoBackpressured || queuedBytes > VIDEO_BACKPRESSURE_DROP_BYTES)) {
         streamStats.videoDroppedFrames += 1
         streamStats.videoDroppedDeltaFrames += 1
+        if (VIDEO_DEBUG && shouldEmitLowRateRuntimeMessage('video')) {
+          debugLog('videoStreamDeltaDropped', {
+            sequence: videoFrameSequence,
+            ptsUs: videoDiagnostics.lastPtsUs,
+            writableLength: queuedBytes,
+            thresholdBytes: VIDEO_BACKPRESSURE_DROP_BYTES
+          })
+        }
         continue
       }
 
