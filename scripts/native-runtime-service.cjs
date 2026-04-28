@@ -60,6 +60,7 @@ const KEY_COMMANDS = new Set([
   'pause',
   'next',
   'prev',
+  'siri',
   'frame'
 ])
 
@@ -2302,26 +2303,52 @@ const sendTouchInput = (body) => {
   }
 }
 
-const sendKeyInput = (body) => {
-  assertInputRuntimeReady()
-  const SendCommand = getNativeExport('SendCommand')
-  if (typeof SendCommand !== 'function') {
-    throw new Error('node-carplay/node does not expose SendCommand')
-  }
-
+const sendKeyInput = async (body) => {
   const command = String(body.command ?? '')
-  if (!KEY_COMMANDS.has(command)) {
-    throw new Error(
-      `key command must be one of: ${Array.from(KEY_COMMANDS).join(', ')}`
-    )
-  }
-
-  carplay.dongleDriver.send(new SendCommand(command))
-  return {
-    ok: true,
-    type: 'key',
+  debugLog('keyCommandReceived', {
     command,
+    allowed: KEY_COMMANDS.has(command),
     session: status.session
+  })
+
+  try {
+    assertInputRuntimeReady()
+    if (!KEY_COMMANDS.has(command)) {
+      throw new Error(
+        `key command must be one of: ${Array.from(KEY_COMMANDS).join(', ')}`
+      )
+    }
+
+    const SendCommand = getNativeExport('SendCommand')
+    if (typeof SendCommand !== 'function') {
+      throw new Error('node-carplay/node does not expose SendCommand')
+    }
+
+    const sendResult = await carplay.dongleDriver.send(new SendCommand(command))
+    if (sendResult === false) {
+      throw new Error(`node-carplay rejected key command ${command}`)
+    }
+
+    debugLog('keyCommandSent', {
+      command,
+      sent: sendResult !== false,
+      session: status.session
+    })
+
+    return {
+      ok: true,
+      type: 'key',
+      command,
+      sent: sendResult !== false,
+      session: status.session
+    }
+  } catch (error) {
+    debugLog('keyCommandFailed', {
+      command,
+      session: status.session,
+      error: getErrorMessage(error)
+    })
+    throw error
   }
 }
 
