@@ -16,6 +16,8 @@ const VIDEO_STREAM_HOST = process.env.CARPLAY_NATIVE_VIDEO_HOST ?? HOST
 const VIDEO_STREAM_PORT = Number(process.env.CARPLAY_NATIVE_VIDEO_PORT ?? PORT + 1)
 const AUDIO_STREAM_HOST = process.env.CARPLAY_NATIVE_AUDIO_HOST ?? '127.0.0.1'
 const AUDIO_STREAM_PORT = Number(process.env.CARPLAY_NATIVE_AUDIO_PORT ?? 4102)
+const MIC_INPUT_HOST = process.env.CARPLAY_NATIVE_MIC_HOST ?? '127.0.0.1'
+const MIC_INPUT_PORT = Number(process.env.CARPLAY_NATIVE_MIC_PORT ?? 4103)
 const CONFIG_PATH =
   process.env.CARPLAY_NATIVE_CONFIG ?? path.join(os.homedir(), '.config', 'react-carplay', 'config.json')
 const DEBUG_LOG_PATH = process.env.CARPLAY_NATIVE_DEBUG_LOG ?? '/tmp/carplay-native-debug.log'
@@ -47,6 +49,20 @@ const H264_NAL_TYPES = {
   AUD: 9
 }
 const H264_LENGTH_PREFIX_SIZES = [4, 3, 2, 1]
+const MIC_PACKET_MAGIC = Buffer.from('CPM1', 'ascii')
+const MIC_PACKET_HEADER_BYTES = 20
+const MIC_SAMPLE_RATE = 16000
+const MIC_CHANNELS = 1
+const MIC_BYTES_PER_SAMPLE = 2
+const MIC_MAX_PAYLOAD_BYTES = 256 * 1024
+const MIC_AUDIO_COMMAND_NAMES = {
+  4: 'AudioPhonecallStart',
+  5: 'AudioPhonecallStop',
+  8: 'AudioSiriStart',
+  9: 'AudioSiriStop'
+}
+const MIC_UPLINK_START_COMMANDS = new Set(['AudioSiriStart', 'AudioPhonecallStart'])
+const MIC_UPLINK_STOP_COMMANDS = new Set(['AudioSiriStop', 'AudioPhonecallStop'])
 const TOUCH_ACTION_NAMES = new Set(['down', 'move', 'up'])
 const KEY_COMMANDS = new Set([
   'home',
@@ -75,6 +91,7 @@ let stopPromise = null
 let httpServer = null
 let videoStreamServer = null
 let audioStreamServer = null
+let micInputServer = null
 let perfStatsTimer = null
 let stopping = false
 let videoFrameSequence = 0
@@ -82,6 +99,8 @@ let recoveryPromise = null
 let lastAudioRuntimeMessageAt = 0
 let lastVideoRuntimeMessageAt = 0
 let lastMediaRuntimeMessageAt = 0
+let micSendQueue = Promise.resolve()
+const micHotPathLogTimestamps = new Map()
 
 const status = {
   desiredSession: 'stopped',
@@ -102,6 +121,14 @@ const status = {
   activeResolution: null,
   audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
   audioBinaryClients: 0,
+  micInputUrl: `tcp://${MIC_INPUT_HOST}:${MIC_INPUT_PORT}`,
+  micClients: 0,
+  micUplinkRequested: false,
+  micPacketsReceived: 0,
+  micPacketsSent: 0,
+  micBytesReceived: 0,
+  micDroppedInactive: 0,
+  micWriteErrors: 0,
   pendingResolution: null,
   updatedAt: Date.now(),
   metadata: {
@@ -206,6 +233,7 @@ const io = new Server({
 const wsClients = new Set()
 const videoStreamClients = new Set()
 const audioStreamClients = new Set()
+const micInputClients = new Set()
 
 const AUDIO_DECODE_TYPE_MAP = {
   1: { frequency: 44100, channel: 2 },
@@ -300,6 +328,14 @@ const shouldEmitLowRateRuntimeMessage = (type) => {
     lastMediaRuntimeMessageAt = current
     return true
   }
+  return true
+}
+
+const shouldEmitLowRateMicLog = (event = 'mic') => {
+  const current = Date.now()
+  const previous = micHotPathLogTimestamps.get(event) ?? 0
+  if (current - previous < HOT_PATH_RUNTIME_MESSAGE_INTERVAL_MS) return false
+  micHotPathLogTimestamps.set(event, current)
   return true
 }
 
@@ -454,7 +490,14 @@ const writeStreamStats = () => {
     videoMalformedPayloads: videoDiagnostics.malformedPayloads,
     videoEmptyPayloads: videoDiagnostics.emptyPayloads,
     videoLastSequence: videoDiagnostics.lastSequence,
-    videoLastPtsUs: videoDiagnostics.lastPtsUs
+    videoLastPtsUs: videoDiagnostics.lastPtsUs,
+    micClients: micInputClients.size,
+    micUplinkRequested: status.micUplinkRequested,
+    micPacketsReceived: status.micPacketsReceived,
+    micPacketsSent: status.micPacketsSent,
+    micBytesReceived: status.micBytesReceived,
+    micDroppedInactive: status.micDroppedInactive,
+    micWriteErrors: status.micWriteErrors
   })
 }
 
@@ -544,6 +587,22 @@ const getAudioStreamStatus = () => ({
   audioPacketFormat: 'CPA1',
   audioPacketHeaderBytes: 24,
   audioBinaryClients: audioStreamClients.size
+})
+
+const getMicInputStatus = () => ({
+  micInputAvailable: Boolean(micInputServer?.listening),
+  micInputUrl: `tcp://${MIC_INPUT_HOST}:${MIC_INPUT_PORT}`,
+  micHost: MIC_INPUT_HOST,
+  micPort: MIC_INPUT_PORT,
+  micPacketFormat: 'CPM1',
+  micPacketHeaderBytes: MIC_PACKET_HEADER_BYTES,
+  micClients: micInputClients.size,
+  micUplinkRequested: status.micUplinkRequested,
+  micPacketsReceived: status.micPacketsReceived,
+  micPacketsSent: status.micPacketsSent,
+  micBytesReceived: status.micBytesReceived,
+  micDroppedInactive: status.micDroppedInactive,
+  micWriteErrors: status.micWriteErrors
 })
 
 const setStatus = (update) => {
@@ -1223,6 +1282,185 @@ const broadcastAudioPacket = (audioMessage) => {
   status.audioBinaryClients = audioStreamClients.size
 }
 
+const getAudioCommandName = (value) => {
+  const mapping = nativeModule?.AudioCommand ?? nativeModule?.default?.AudioCommand
+  return mapping?.[value] ?? MIC_AUDIO_COMMAND_NAMES[value] ?? null
+}
+
+const setMicUplinkRequested = (requested, reason, commandValue) => {
+  if (status.micUplinkRequested === requested) return
+
+  setStatus({ micUplinkRequested: requested })
+  debugLog(requested ? 'micUplinkStart' : 'micUplinkStop', {
+    reason,
+    commandValue,
+    micClients: micInputClients.size
+  })
+}
+
+const updateMicUplinkFromAudioCommand = (audioMessage) => {
+  const commandValue = Number(audioMessage?.command)
+  if (!Number.isFinite(commandValue)) return
+
+  const commandName = getAudioCommandName(commandValue)
+  if (MIC_UPLINK_START_COMMANDS.has(commandName)) {
+    setMicUplinkRequested(true, commandName, commandValue)
+  } else if (MIC_UPLINK_STOP_COMMANDS.has(commandName)) {
+    setMicUplinkRequested(false, commandName, commandValue)
+  }
+}
+
+const logMicHotPath = (event, details = {}) => {
+  if (!shouldEmitLowRateMicLog(event)) return
+  debugLog(event, {
+    ...details,
+    micUplinkRequested: status.micUplinkRequested,
+    micClients: micInputClients.size
+  })
+}
+
+const int16ArrayFromMicPayload = (payload) => {
+  if (payload.byteLength % MIC_BYTES_PER_SAMPLE !== 0) {
+    throw new Error(`Mic PCM payload byte length must be divisible by ${MIC_BYTES_PER_SAMPLE}`)
+  }
+
+  const exactBuffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
+  return new Int16Array(exactBuffer)
+}
+
+const sendMicPcmPayload = async (payload, metadata) => {
+  try {
+    if (!status.micUplinkRequested) {
+      status.micDroppedInactive += 1
+      logMicHotPath('micPacketDropped', {
+        reason: 'inactive',
+        ...metadata
+      })
+      return
+    }
+
+    if (!carplay?.dongleDriver || typeof carplay.dongleDriver.send !== 'function') {
+      throw new Error('CarPlay runtime is not active')
+    }
+
+    const SendAudio = getNativeExport('SendAudio')
+    if (typeof SendAudio !== 'function') {
+      throw new Error('node-carplay/node does not expose SendAudio')
+    }
+
+    const int16Array = int16ArrayFromMicPayload(payload)
+    const sendResult = await carplay.dongleDriver.send(new SendAudio(int16Array))
+    if (sendResult === false) {
+      throw new Error('node-carplay rejected mic audio')
+    }
+
+    status.micPacketsSent += 1
+    logMicHotPath('micPacketSent', {
+      ...metadata,
+      samples: int16Array.length
+    })
+  } catch (error) {
+    status.micWriteErrors += 1
+    logMicHotPath('micSendError', {
+      ...metadata,
+      error: getErrorMessage(error)
+    })
+  }
+}
+
+const queueMicPcmPayload = (payload, metadata) => {
+  micSendQueue = micSendQueue.then(
+    () => sendMicPcmPayload(payload, metadata),
+    () => sendMicPcmPayload(payload, metadata)
+  )
+}
+
+const handleMicPacket = (payload, metadata) => {
+  status.micPacketsReceived += 1
+  status.micBytesReceived += payload.byteLength
+
+  const expectedPayloadBytes = metadata.frameCount * metadata.channels * metadata.bytesPerSample
+  if (
+    metadata.sampleRate !== MIC_SAMPLE_RATE ||
+    metadata.channels !== MIC_CHANNELS ||
+    metadata.bytesPerSample !== MIC_BYTES_PER_SAMPLE ||
+    payload.byteLength !== metadata.payloadBytes ||
+    payload.byteLength !== expectedPayloadBytes ||
+    payload.byteLength % MIC_BYTES_PER_SAMPLE !== 0
+  ) {
+    logMicHotPath('micPacketInvalid', {
+      reason: 'unsupported-format-or-size',
+      ...metadata,
+      actualPayloadBytes: payload.byteLength,
+      expectedPayloadBytes
+    })
+    return
+  }
+
+  if (!status.micUplinkRequested) {
+    status.micDroppedInactive += 1
+    logMicHotPath('micPacketDropped', {
+      reason: 'inactive',
+      ...metadata
+    })
+    return
+  }
+
+  queueMicPcmPayload(payload, metadata)
+}
+
+const parseMicInputBuffer = (socket) => {
+  let buffer = socket.__carplayMicBuffer ?? Buffer.alloc(0)
+
+  while (buffer.byteLength >= MIC_PACKET_HEADER_BYTES) {
+    if (!buffer.subarray(0, 4).equals(MIC_PACKET_MAGIC)) {
+      const nextMagic = buffer.indexOf(MIC_PACKET_MAGIC, 1)
+      const discardedBytes = nextMagic >= 0 ? nextMagic : Math.max(0, buffer.byteLength - 3)
+      logMicHotPath('micPacketInvalid', {
+        reason: 'bad-magic',
+        discardedBytes
+      })
+      buffer = nextMagic >= 0 ? buffer.subarray(nextMagic) : buffer.subarray(buffer.byteLength - 3)
+      continue
+    }
+
+    const sampleRate = buffer.readUInt32LE(4)
+    const channels = buffer.readUInt16LE(8)
+    const bytesPerSample = buffer.readUInt16LE(10)
+    const frameCount = buffer.readUInt32LE(12)
+    const payloadBytes = buffer.readUInt32LE(16)
+    const packetBytes = MIC_PACKET_HEADER_BYTES + payloadBytes
+
+    if (payloadBytes > MIC_MAX_PAYLOAD_BYTES) {
+      logMicHotPath('micPacketInvalid', {
+        reason: 'payload-too-large',
+        sampleRate,
+        channels,
+        bytesPerSample,
+        frameCount,
+        payloadBytes,
+        maxPayloadBytes: MIC_MAX_PAYLOAD_BYTES
+      })
+      socket.destroy()
+      return
+    }
+
+    if (buffer.byteLength < packetBytes) break
+
+    const payload = buffer.subarray(MIC_PACKET_HEADER_BYTES, packetBytes)
+    handleMicPacket(payload, {
+      sampleRate,
+      channels,
+      bytesPerSample,
+      frameCount,
+      payloadBytes
+    })
+    buffer = buffer.subarray(packetBytes)
+  }
+
+  socket.__carplayMicBuffer = buffer
+}
+
 const broadcastVideoAccessUnit = (videoInfo) => {
   if (!videoInfo?.data) return
 
@@ -1384,6 +1622,59 @@ const startAudioStreamServer = () => {
   })
 }
 
+const startMicInputServer = () => {
+  micInputServer = net.createServer((socket) => {
+    socket.setNoDelay(true)
+    socket.__carplayMicBuffer = Buffer.alloc(0)
+    micInputClients.add(socket)
+    setStatus({
+      micInputUrl: `tcp://${MIC_INPUT_HOST}:${MIC_INPUT_PORT}`,
+      micClients: micInputClients.size
+    })
+    debugLog('micClientConnected', {
+      clients: micInputClients.size,
+      remoteAddress: socket.remoteAddress,
+      remotePort: socket.remotePort
+    })
+
+    socket.on('data', (chunk) => {
+      socket.__carplayMicBuffer = Buffer.concat([socket.__carplayMicBuffer ?? Buffer.alloc(0), chunk])
+      parseMicInputBuffer(socket)
+    })
+    socket.on('close', () => {
+      micInputClients.delete(socket)
+      setStatus({ micClients: micInputClients.size })
+      debugLog('micClientDisconnected', {
+        clients: micInputClients.size
+      })
+    })
+    socket.on('error', (error) => {
+      micInputClients.delete(socket)
+      setStatus({ micClients: micInputClients.size })
+      debugLog('micClientDisconnected', {
+        clients: micInputClients.size,
+        error: getErrorMessage(error)
+      })
+    })
+  })
+
+  micInputServer.on('error', (error) => {
+    log('sessionError', {
+      source: 'micInput',
+      error: getErrorMessage(error),
+      diagnostic: `Unable to listen on ${MIC_INPUT_HOST}:${MIC_INPUT_PORT}`
+    })
+  })
+
+  micInputServer.listen(MIC_INPUT_PORT, MIC_INPUT_HOST, () => {
+    setStatus({
+      micInputUrl: `tcp://${MIC_INPUT_HOST}:${MIC_INPUT_PORT}`,
+      micClients: micInputClients.size
+    })
+    log('micServerListening', getMicInputStatus())
+  })
+}
+
 const loadDependencies = () => {
   nativeModule = require('node-carplay/node')
   usbModule = require('usb')
@@ -1412,7 +1703,8 @@ const loadDependencies = () => {
     usbSupportsWebUsbCreateInstance: typeof usbModule?.WebUSBDevice?.createInstance === 'function',
     configPath: CONFIG_PATH,
     host: HOST,
-    port: PORT
+    port: PORT,
+    micInputUrl: `tcp://${MIC_INPUT_HOST}:${MIC_INPUT_PORT}`
   })
 }
 
@@ -1858,6 +2150,7 @@ const attachMessageHandler = () => {
       case 'unplugged':
       case 'phoneDisconnected':
         log('phoneDisconnected')
+        setMicUplinkRequested(false, 'phoneDisconnected')
         setSession('waiting_for_phone', {
           isPlugged: false,
           receivingVideo: false
@@ -1888,6 +2181,7 @@ const attachMessageHandler = () => {
         }
         break
       case 'audio':
+        updateMicUplinkFromAudioCommand(message?.message)
         broadcastAudioPacket(message?.message)
         if (AUDIO_DEBUG) {
           if (shouldEmitLowRateRuntimeMessage(type)) {
@@ -2087,6 +2381,7 @@ const resetDeviceForStop = async (device) => {
 
 const cleanupNativeRuntime = async ({ reason = 'stopSession', emitStopped = true } = {}) => {
   clearRuntimeTimers()
+  setMicUplinkRequested(false, reason)
 
   const driver = carplay?.dongleDriver
   const device = activeWebUsbDevice ?? driver?._device
@@ -2124,6 +2419,7 @@ const stopSession = async () => {
       isPlugged: false,
       deviceFound: Boolean(findDongle()),
       receivingVideo: false,
+      micUplinkRequested: false,
       stoppedAt: Date.now(),
       activeVideoConfig: null,
       pendingVideoConfig: getConfiguredVideoConfig(config),
@@ -2583,10 +2879,15 @@ const shutdown = async () => {
     socket.end()
   }
   audioStreamClients.clear()
+  for (const socket of micInputClients) {
+    socket.end()
+  }
+  micInputClients.clear()
   io.close()
   httpServer?.close()
   videoStreamServer?.close()
   audioStreamServer?.close()
+  micInputServer?.close()
 }
 
 const main = async () => {
@@ -2604,6 +2905,7 @@ const main = async () => {
   httpServer.listen(PORT, HOST)
   startVideoStreamServer()
   startAudioStreamServer()
+  startMicInputServer()
   perfStatsTimer = setInterval(writeStreamStats, PERF_STATS_INTERVAL_MS)
   perfStatsTimer.unref?.()
   emitConfig()
@@ -2617,6 +2919,7 @@ const main = async () => {
     socketIoUrl: `http://${HOST}:${PORT}`,
     videoStreamUrl: `tcp://${VIDEO_STREAM_HOST}:${VIDEO_STREAM_PORT}`,
     audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
+    micInputUrl: `tcp://${MIC_INPUT_HOST}:${MIC_INPUT_PORT}`,
     configPath: CONFIG_PATH,
     autoStart: AUTO_START
   })
