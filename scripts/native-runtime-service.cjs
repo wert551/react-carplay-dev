@@ -55,11 +55,20 @@ const MIC_SAMPLE_RATE = 16000
 const MIC_CHANNELS = 1
 const MIC_BYTES_PER_SAMPLE = 2
 const MIC_MAX_PAYLOAD_BYTES = 256 * 1024
-const MIC_AUDIO_COMMAND_NAMES = {
+const AUDIO_COMMAND_NAMES = {
+  1: 'AudioOutputStart',
+  2: 'AudioOutputStop',
+  3: 'AudioInputConfig',
   4: 'AudioPhonecallStart',
   5: 'AudioPhonecallStop',
+  6: 'AudioNaviStart',
+  7: 'AudioNaviStop',
   8: 'AudioSiriStart',
-  9: 'AudioSiriStop'
+  9: 'AudioSiriStop',
+  10: 'AudioMediaStart',
+  11: 'AudioMediaStop',
+  12: 'AudioAlertStart',
+  13: 'AudioAlertStop'
 }
 const MIC_UPLINK_START_COMMANDS = new Set(['AudioSiriStart', 'AudioPhonecallStart'])
 const MIC_UPLINK_STOP_COMMANDS = new Set(['AudioSiriStop', 'AudioPhonecallStop'])
@@ -182,6 +191,7 @@ const videoDiagnostics = {
 
 const streamStats = {
   audioPackets: 0,
+  audioCommandPackets: 0,
   audioBytesForwarded: 0,
   audioDroppedClients: 0,
   audioMaxWritableLength: 0,
@@ -201,6 +211,7 @@ const streamStats = {
   consecutiveVideoStallIntervals: 0,
   consecutiveAudioStallIntervals: 0,
   lastAudioPackets: 0,
+  lastAudioCommandPackets: 0,
   lastAudioBytesForwarded: 0,
   lastAudioDroppedClients: 0,
   lastAudioWriteErrors: 0,
@@ -354,6 +365,7 @@ const resetStreamStallDiagnostics = () => {
 
 const writeStreamStats = () => {
   const audioPackets = streamStats.audioPackets - streamStats.lastAudioPackets
+  const audioCommandPackets = streamStats.audioCommandPackets - streamStats.lastAudioCommandPackets
   const audioBytesForwarded = streamStats.audioBytesForwarded - streamStats.lastAudioBytesForwarded
   const audioDroppedClients = streamStats.audioDroppedClients - streamStats.lastAudioDroppedClients
   const audioMaxWritableLength = streamStats.audioMaxWritableLength
@@ -390,6 +402,7 @@ const writeStreamStats = () => {
     lastAudioPacketAgeMs > AUDIO_STALL_MS
 
   streamStats.lastAudioPackets = streamStats.audioPackets
+  streamStats.lastAudioCommandPackets = streamStats.audioCommandPackets
   streamStats.lastAudioBytesForwarded = streamStats.audioBytesForwarded
   streamStats.lastAudioDroppedClients = streamStats.audioDroppedClients
   streamStats.audioMaxWritableLength = 0
@@ -457,6 +470,7 @@ const writeStreamStats = () => {
   debugLog('streamPerformanceStats', {
     intervalMs: PERF_STATS_INTERVAL_MS,
     audioPackets,
+    audioCommandPackets,
     audioBytesForwarded,
     audioClients: audioStreamClients.size,
     audioMaxWritableLength,
@@ -1210,12 +1224,13 @@ const writeVideoPacket = (socket, payload, flags, pts) => {
 
 const writeAudioPacket = (socket, audioMessage, payload) => {
   const decodeType = audioMessage?.decodeType
+  const hasPayload = payload.byteLength > 0
   const decodeTypeMap = nativeModule?.decodeTypeMap ?? nativeModule?.default?.decodeTypeMap
   const format = decodeTypeMap?.[decodeType] ?? AUDIO_DECODE_TYPE_MAP[decodeType] ?? {}
-  const sampleRate = Number(format.frequency) > 0 ? Number(format.frequency) : 44100
-  const channels = Number(format.channel) > 0 ? Number(format.channel) : 2
+  const sampleRate = Number(format.frequency) > 0 ? Number(format.frequency) : hasPayload ? 44100 : 0
+  const channels = Number(format.channel) > 0 ? Number(format.channel) : hasPayload ? 2 : 0
   const bytesPerSample = 2
-  const frameCount = Math.floor(payload.byteLength / (channels * bytesPerSample))
+  const frameCount = channels > 0 ? Math.floor(payload.byteLength / (channels * bytesPerSample)) : 0
   const command = Number.isFinite(Number(audioMessage?.command)) ? Number(audioMessage.command) : 0
   const header = Buffer.alloc(24)
 
@@ -1230,7 +1245,7 @@ const writeAudioPacket = (socket, audioMessage, payload) => {
   socket.cork?.()
   try {
     const headerAccepted = socket.write(header)
-    const payloadAccepted = socket.write(payload)
+    const payloadAccepted = hasPayload ? socket.write(payload) : true
     return headerAccepted && payloadAccepted
   } finally {
     socket.uncork?.()
@@ -1239,13 +1254,21 @@ const writeAudioPacket = (socket, audioMessage, payload) => {
 
 const broadcastAudioPacket = (audioMessage) => {
   const data = audioMessage?.data
-  if (!data) return
+  const commandValue = Number(audioMessage?.command)
+  const hasCommand = Number.isFinite(commandValue)
+  const hasPcmData = Boolean(data) && getPayloadByteLength(data) > 0
+  if (!hasPcmData && !hasCommand) return
 
-  const payload = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
-  if (payload.byteLength === 0) return
+  const payload = hasPcmData ? Buffer.from(data.buffer, data.byteOffset, data.byteLength) : Buffer.alloc(0)
+  const commandOnly = !hasPcmData && hasCommand
+  let forwardedCommandOnly = false
 
-  streamStats.audioPackets += 1
-  streamStats.lastAudioPacketAt = Date.now()
+  if (commandOnly) {
+    streamStats.audioCommandPackets += 1
+  } else {
+    streamStats.audioPackets += 1
+    streamStats.lastAudioPacketAt = Date.now()
+  }
 
   if (audioStreamClients.size === 0) return
 
@@ -1269,6 +1292,7 @@ const broadcastAudioPacket = (audioMessage) => {
       socket.__carplayAudioBackpressured = !accepted
       updateMaxWritableLength('audio', socket)
       streamStats.audioBytesForwarded += payload.byteLength
+      if (commandOnly) forwardedCommandOnly = true
     } catch (error) {
       streamStats.audioWriteErrors += 1
       streamStats.audioDroppedClients += 1
@@ -1282,12 +1306,24 @@ const broadcastAudioPacket = (audioMessage) => {
     }
   }
 
+  if (forwardedCommandOnly) {
+    debugLog('audioCommandOnlyForwarded', {
+      commandName: getAudioCommandName(commandValue),
+      commandValue,
+      audioType: audioMessage?.audioType,
+      decodeType: audioMessage?.decodeType,
+      volume: audioMessage?.volume,
+      volumeDuration: audioMessage?.volumeDuration,
+      clients: audioStreamClients.size
+    })
+  }
+
   status.audioBinaryClients = audioStreamClients.size
 }
 
 const getAudioCommandName = (value) => {
   const mapping = nativeModule?.AudioCommand ?? nativeModule?.default?.AudioCommand
-  return mapping?.[value] ?? MIC_AUDIO_COMMAND_NAMES[value] ?? null
+  return mapping?.[value] ?? AUDIO_COMMAND_NAMES[value] ?? null
 }
 
 const setMicUplinkRequested = (requested, reason, commandValue) => {
