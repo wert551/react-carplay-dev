@@ -1362,6 +1362,7 @@ const writeAudioPacket = (socket, payload, metadata) => {
 }
 
 const logCpa2AudioForwarded = (event, metadata) => {
+  if (!AUDIO_DEBUG) return
   debugLog(event, {
     sequence: metadata.sequence,
     commandName: metadata.commandName,
@@ -1450,7 +1451,7 @@ const broadcastAudioPacket = (audioMessage) => {
     }
   }
 
-  if (forwardedCommandOnly) {
+  if (AUDIO_DEBUG && forwardedCommandOnly) {
     debugLog('audioCommandOnlyForwarded', {
       commandName: metadata.commandName,
       commandValue: metadata.command,
