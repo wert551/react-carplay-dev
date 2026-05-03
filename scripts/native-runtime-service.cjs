@@ -63,6 +63,7 @@ const MIC_AUDIO_COMMAND_NAMES = {
 }
 const MIC_UPLINK_START_COMMANDS = new Set(['AudioSiriStart', 'AudioPhonecallStart'])
 const MIC_UPLINK_STOP_COMMANDS = new Set(['AudioSiriStop', 'AudioPhonecallStop'])
+const NIGHT_MODE_COMMANDS = new Set(['enableNightMode', 'disableNightMode'])
 const TOUCH_ACTION_NAMES = new Set(['down', 'move', 'up'])
 const KEY_COMMANDS = new Set([
   'home',
@@ -77,6 +78,8 @@ const KEY_COMMANDS = new Set([
   'next',
   'prev',
   'siri',
+  'enableNightMode',
+  'disableNightMode',
   'frame'
 ])
 
@@ -2599,13 +2602,34 @@ const sendTouchInput = (body) => {
   }
 }
 
+const persistNightModeConfig = (nightMode) => {
+  config = {
+    ...config,
+    nightMode
+  }
+  if (carplay?._config && typeof carplay._config === 'object') {
+    carplay._config.nightMode = nightMode
+  }
+  persistConfig()
+  emitConfig()
+}
+
 const sendKeyInput = async (body) => {
   const command = String(body.command ?? '')
+  const isNightModeCommand = NIGHT_MODE_COMMANDS.has(command)
+  const requestedNightMode = command === 'enableNightMode' ? true : command === 'disableNightMode' ? false : null
   debugLog('keyCommandReceived', {
     command,
     allowed: KEY_COMMANDS.has(command),
     session: status.session
   })
+  if (isNightModeCommand) {
+    debugLog('nightModeCommandReceived', {
+      command,
+      nightMode: requestedNightMode,
+      session: status.session
+    })
+  }
 
   try {
     assertInputRuntimeReady()
@@ -2630,20 +2654,39 @@ const sendKeyInput = async (body) => {
       sent: sendResult !== false,
       session: status.session
     })
+    if (isNightModeCommand) {
+      persistNightModeConfig(requestedNightMode)
+      debugLog('nightModeCommandSent', {
+        command,
+        nightMode: requestedNightMode,
+        sent: sendResult !== false,
+        session: status.session
+      })
+    }
 
-    return {
+    const result = {
       ok: true,
       type: 'key',
       command,
       sent: sendResult !== false,
       session: status.session
     }
+    if (isNightModeCommand) result.nightMode = requestedNightMode
+    return result
   } catch (error) {
     debugLog('keyCommandFailed', {
       command,
       session: status.session,
       error: getErrorMessage(error)
     })
+    if (isNightModeCommand) {
+      debugLog('nightModeCommandFailed', {
+        command,
+        nightMode: requestedNightMode,
+        session: status.session,
+        error: getErrorMessage(error)
+      })
+    }
     throw error
   }
 }
