@@ -18,6 +18,8 @@ const AUDIO_STREAM_HOST = process.env.CARPLAY_NATIVE_AUDIO_HOST ?? '127.0.0.1'
 const AUDIO_STREAM_PORT = Number(process.env.CARPLAY_NATIVE_AUDIO_PORT ?? 4102)
 const MIC_INPUT_HOST = process.env.CARPLAY_NATIVE_MIC_HOST ?? '127.0.0.1'
 const MIC_INPUT_PORT = Number(process.env.CARPLAY_NATIVE_MIC_PORT ?? 4103)
+const AUDIO_PACKET_FORMAT_ENV = String(process.env.CARPLAY_NATIVE_AUDIO_PACKET_FORMAT ?? 'CPA2').toUpperCase()
+const AUDIO_PACKET_FORMAT = AUDIO_PACKET_FORMAT_ENV === 'CPA1' ? 'CPA1' : 'CPA2'
 const CONFIG_PATH =
   process.env.CARPLAY_NATIVE_CONFIG ?? path.join(os.homedir(), '.config', 'react-carplay', 'config.json')
 const DEBUG_LOG_PATH = process.env.CARPLAY_NATIVE_DEBUG_LOG ?? '/tmp/carplay-native-debug.log'
@@ -49,6 +51,11 @@ const H264_NAL_TYPES = {
   AUD: 9
 }
 const H264_LENGTH_PREFIX_SIZES = [4, 3, 2, 1]
+const AUDIO_PACKET_HEADER_BYTES = AUDIO_PACKET_FORMAT === 'CPA2' ? 64 : 24
+const CPA2_HEADER_BYTES = 64
+const CPA2_FLAG_HAS_PCM_PAYLOAD = 1 << 0
+const CPA2_FLAG_COMMAND_ONLY = 1 << 1
+const CPA2_FLAG_METADATA_VALID = 1 << 2
 const MIC_PACKET_MAGIC = Buffer.from('CPM1', 'ascii')
 const MIC_PACKET_HEADER_BYTES = 20
 const MIC_SAMPLE_RATE = 16000
@@ -107,6 +114,7 @@ let micInputServer = null
 let perfStatsTimer = null
 let stopping = false
 let videoFrameSequence = 0
+let audioCpa2Sequence = 0
 let recoveryPromise = null
 let lastAudioRuntimeMessageAt = 0
 let lastVideoRuntimeMessageAt = 0
@@ -193,6 +201,10 @@ const streamStats = {
   audioPackets: 0,
   audioCommandPackets: 0,
   audioBytesForwarded: 0,
+  audioCpa2Packets: 0,
+  audioCpa2PcmPackets: 0,
+  audioCpa2CommandPackets: 0,
+  audioCpa2BytesForwarded: 0,
   audioDroppedClients: 0,
   audioMaxWritableLength: 0,
   audioWriteErrors: 0,
@@ -213,6 +225,10 @@ const streamStats = {
   lastAudioPackets: 0,
   lastAudioCommandPackets: 0,
   lastAudioBytesForwarded: 0,
+  lastAudioCpa2Packets: 0,
+  lastAudioCpa2PcmPackets: 0,
+  lastAudioCpa2CommandPackets: 0,
+  lastAudioCpa2BytesForwarded: 0,
   lastAudioDroppedClients: 0,
   lastAudioWriteErrors: 0,
   lastVideoPackets: 0,
@@ -367,6 +383,10 @@ const writeStreamStats = () => {
   const audioPackets = streamStats.audioPackets - streamStats.lastAudioPackets
   const audioCommandPackets = streamStats.audioCommandPackets - streamStats.lastAudioCommandPackets
   const audioBytesForwarded = streamStats.audioBytesForwarded - streamStats.lastAudioBytesForwarded
+  const audioCpa2Packets = streamStats.audioCpa2Packets - streamStats.lastAudioCpa2Packets
+  const audioCpa2PcmPackets = streamStats.audioCpa2PcmPackets - streamStats.lastAudioCpa2PcmPackets
+  const audioCpa2CommandPackets = streamStats.audioCpa2CommandPackets - streamStats.lastAudioCpa2CommandPackets
+  const audioCpa2BytesForwarded = streamStats.audioCpa2BytesForwarded - streamStats.lastAudioCpa2BytesForwarded
   const audioDroppedClients = streamStats.audioDroppedClients - streamStats.lastAudioDroppedClients
   const audioMaxWritableLength = streamStats.audioMaxWritableLength
   const audioWriteErrors = streamStats.audioWriteErrors - streamStats.lastAudioWriteErrors
@@ -404,6 +424,10 @@ const writeStreamStats = () => {
   streamStats.lastAudioPackets = streamStats.audioPackets
   streamStats.lastAudioCommandPackets = streamStats.audioCommandPackets
   streamStats.lastAudioBytesForwarded = streamStats.audioBytesForwarded
+  streamStats.lastAudioCpa2Packets = streamStats.audioCpa2Packets
+  streamStats.lastAudioCpa2PcmPackets = streamStats.audioCpa2PcmPackets
+  streamStats.lastAudioCpa2CommandPackets = streamStats.audioCpa2CommandPackets
+  streamStats.lastAudioCpa2BytesForwarded = streamStats.audioCpa2BytesForwarded
   streamStats.lastAudioDroppedClients = streamStats.audioDroppedClients
   streamStats.audioMaxWritableLength = 0
   streamStats.lastAudioWriteErrors = streamStats.audioWriteErrors
@@ -472,6 +496,11 @@ const writeStreamStats = () => {
     audioPackets,
     audioCommandPackets,
     audioBytesForwarded,
+    audioPacketFormat: AUDIO_PACKET_FORMAT,
+    audioCpa2Packets,
+    audioCpa2PcmPackets,
+    audioCpa2CommandPackets,
+    audioCpa2BytesForwarded,
     audioClients: audioStreamClients.size,
     audioMaxWritableLength,
     audioDroppedClients,
@@ -601,8 +630,8 @@ const getAudioStreamStatus = () => ({
   audioStreamUrl: `tcp://${AUDIO_STREAM_HOST}:${AUDIO_STREAM_PORT}`,
   audioHost: AUDIO_STREAM_HOST,
   audioPort: AUDIO_STREAM_PORT,
-  audioPacketFormat: 'CPA1',
-  audioPacketHeaderBytes: 24,
+  audioPacketFormat: AUDIO_PACKET_FORMAT,
+  audioPacketHeaderBytes: AUDIO_PACKET_HEADER_BYTES,
   audioBinaryClients: audioStreamClients.size
 })
 
@@ -1222,8 +1251,22 @@ const writeVideoPacket = (socket, payload, flags, pts) => {
   }
 }
 
-const writeAudioPacket = (socket, audioMessage, payload) => {
-  const decodeType = audioMessage?.decodeType
+const asFiniteNumber = (value, fallback = 0) => {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : fallback
+}
+
+const asUint32 = (value, fallback = 0) => asFiniteNumber(value, fallback) >>> 0
+
+const getAudioTimestampUs = () => {
+  if (typeof process.hrtime?.bigint === 'function') {
+    return process.hrtime.bigint() / 1000n
+  }
+  return BigInt(Date.now()) * 1000n
+}
+
+const getAudioPacketMetadata = (audioMessage, payload, commandOnly) => {
+  const decodeType = asUint32(audioMessage?.decodeType)
   const hasPayload = payload.byteLength > 0
   const decodeTypeMap = nativeModule?.decodeTypeMap ?? nativeModule?.default?.decodeTypeMap
   const format = decodeTypeMap?.[decodeType] ?? AUDIO_DECODE_TYPE_MAP[decodeType] ?? {}
@@ -1231,25 +1274,108 @@ const writeAudioPacket = (socket, audioMessage, payload) => {
   const channels = Number(format.channel) > 0 ? Number(format.channel) : hasPayload ? 2 : 0
   const bytesPerSample = 2
   const frameCount = channels > 0 ? Math.floor(payload.byteLength / (channels * bytesPerSample)) : 0
-  const command = Number.isFinite(Number(audioMessage?.command)) ? Number(audioMessage.command) : 0
+  const command = asUint32(audioMessage?.command)
+  const audioType = asUint32(audioMessage?.audioType)
+  const volume = asFiniteNumber(audioMessage?.volume, 0)
+  const volumeDuration = asUint32(audioMessage?.volumeDuration)
+  const metadataValid =
+    audioMessage != null &&
+    ['command', 'decodeType', 'audioType', 'volume', 'volumeDuration'].some((key) => audioMessage[key] != null)
+  const flags =
+    (hasPayload ? CPA2_FLAG_HAS_PCM_PAYLOAD : 0) |
+    (commandOnly ? CPA2_FLAG_COMMAND_ONLY : 0) |
+    (metadataValid ? CPA2_FLAG_METADATA_VALID : 0)
+
+  return {
+    command,
+    decodeType,
+    audioType,
+    sampleRate,
+    channels,
+    bytesPerSample,
+    frameCount,
+    payloadBytes: payload.byteLength,
+    volume,
+    volumeDuration,
+    flags,
+    commandName: getAudioCommandName(command)
+  }
+}
+
+const writeCpa1AudioPacket = (socket, payload, metadata) => {
   const header = Buffer.alloc(24)
 
   header.write('CPA1', 0, 4, 'ascii')
-  header.writeUInt32LE(sampleRate, 4)
-  header.writeUInt16LE(channels, 8)
-  header.writeUInt16LE(bytesPerSample, 10)
-  header.writeUInt32LE(frameCount, 12)
-  header.writeUInt32LE(command >>> 0, 16)
+  header.writeUInt32LE(metadata.sampleRate, 4)
+  header.writeUInt16LE(metadata.channels, 8)
+  header.writeUInt16LE(metadata.bytesPerSample, 10)
+  header.writeUInt32LE(metadata.frameCount, 12)
+  header.writeUInt32LE(metadata.command, 16)
   header.writeUInt32LE(payload.byteLength, 20)
 
   socket.cork?.()
   try {
     const headerAccepted = socket.write(header)
-    const payloadAccepted = hasPayload ? socket.write(payload) : true
+    const payloadAccepted = payload.byteLength > 0 ? socket.write(payload) : true
     return headerAccepted && payloadAccepted
   } finally {
     socket.uncork?.()
   }
+}
+
+const writeCpa2AudioPacket = (socket, payload, metadata) => {
+  const header = Buffer.alloc(CPA2_HEADER_BYTES)
+
+  header.write('CPA2', 0, 4, 'ascii')
+  header.writeUInt16LE(1, 4)
+  header.writeUInt16LE(CPA2_HEADER_BYTES, 6)
+  header.writeUInt32LE(metadata.flags, 8)
+  header.writeUInt32LE(metadata.sequence, 12)
+  header.writeBigUInt64LE(metadata.timestampUs, 16)
+  header.writeUInt32LE(metadata.command, 24)
+  header.writeUInt32LE(metadata.decodeType, 28)
+  header.writeUInt32LE(metadata.audioType, 32)
+  header.writeUInt32LE(metadata.sampleRate, 36)
+  header.writeUInt16LE(metadata.channels, 40)
+  header.writeUInt16LE(metadata.bytesPerSample, 42)
+  header.writeUInt32LE(metadata.frameCount, 44)
+  header.writeUInt32LE(metadata.payloadBytes, 48)
+  header.writeFloatLE(metadata.volume, 52)
+  header.writeUInt32LE(metadata.volumeDuration, 56)
+  header.writeUInt32LE(0, 60)
+
+  socket.cork?.()
+  try {
+    const headerAccepted = socket.write(header)
+    const payloadAccepted = payload.byteLength > 0 ? socket.write(payload) : true
+    return headerAccepted && payloadAccepted
+  } finally {
+    socket.uncork?.()
+  }
+}
+
+const writeAudioPacket = (socket, payload, metadata) => {
+  if (AUDIO_PACKET_FORMAT === 'CPA2') {
+    return writeCpa2AudioPacket(socket, payload, metadata)
+  }
+  return writeCpa1AudioPacket(socket, payload, metadata)
+}
+
+const logCpa2AudioForwarded = (event, metadata) => {
+  debugLog(event, {
+    sequence: metadata.sequence,
+    commandName: metadata.commandName,
+    commandValue: metadata.command,
+    decodeType: metadata.decodeType,
+    audioType: metadata.audioType,
+    sampleRate: metadata.sampleRate,
+    channels: metadata.channels,
+    frameCount: metadata.frameCount,
+    payloadBytes: metadata.payloadBytes,
+    volume: metadata.volume,
+    volumeDuration: metadata.volumeDuration,
+    flags: metadata.flags
+  })
 }
 
 const broadcastAudioPacket = (audioMessage) => {
@@ -1261,13 +1387,27 @@ const broadcastAudioPacket = (audioMessage) => {
 
   const payload = hasPcmData ? Buffer.from(data.buffer, data.byteOffset, data.byteLength) : Buffer.alloc(0)
   const commandOnly = !hasPcmData && hasCommand
+  const metadata = getAudioPacketMetadata(audioMessage, payload, commandOnly)
   let forwardedCommandOnly = false
+  let forwardedCpa2 = false
 
   if (commandOnly) {
     streamStats.audioCommandPackets += 1
   } else {
     streamStats.audioPackets += 1
     streamStats.lastAudioPacketAt = Date.now()
+  }
+
+  if (AUDIO_PACKET_FORMAT === 'CPA2') {
+    audioCpa2Sequence = (audioCpa2Sequence + 1) >>> 0
+    metadata.sequence = audioCpa2Sequence
+    metadata.timestampUs = getAudioTimestampUs()
+    streamStats.audioCpa2Packets += 1
+    if (commandOnly) {
+      streamStats.audioCpa2CommandPackets += 1
+    } else {
+      streamStats.audioCpa2PcmPackets += 1
+    }
   }
 
   if (audioStreamClients.size === 0) return
@@ -1288,11 +1428,15 @@ const broadcastAudioPacket = (audioMessage) => {
         continue
       }
 
-      const accepted = writeAudioPacket(socket, audioMessage, payload)
+      const accepted = writeAudioPacket(socket, payload, metadata)
       socket.__carplayAudioBackpressured = !accepted
       updateMaxWritableLength('audio', socket)
       streamStats.audioBytesForwarded += payload.byteLength
       if (commandOnly) forwardedCommandOnly = true
+      if (AUDIO_PACKET_FORMAT === 'CPA2') {
+        streamStats.audioCpa2BytesForwarded += CPA2_HEADER_BYTES + payload.byteLength
+        forwardedCpa2 = true
+      }
     } catch (error) {
       streamStats.audioWriteErrors += 1
       streamStats.audioDroppedClients += 1
@@ -1308,14 +1452,21 @@ const broadcastAudioPacket = (audioMessage) => {
 
   if (forwardedCommandOnly) {
     debugLog('audioCommandOnlyForwarded', {
-      commandName: getAudioCommandName(commandValue),
-      commandValue,
+      commandName: metadata.commandName,
+      commandValue: metadata.command,
       audioType: audioMessage?.audioType,
       decodeType: audioMessage?.decodeType,
       volume: audioMessage?.volume,
       volumeDuration: audioMessage?.volumeDuration,
       clients: audioStreamClients.size
     })
+  }
+
+  if (forwardedCpa2) {
+    logCpa2AudioForwarded(
+      commandOnly ? 'audioCpa2CommandOnlyForwarded' : 'audioCpa2PcmForwarded',
+      metadata
+    )
   }
 
   status.audioBinaryClients = audioStreamClients.size
